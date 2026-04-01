@@ -5,7 +5,10 @@
 // @description  自动播放LMS视频，自动切超清防止无法播放，进度100%自动下一页。若视频播完但进度未满则自动重播。遇讨论页跳过。含悬浮控制与Toast提示。
 // @author       ntgmc
 // @match        *://lms.sysu.edu.cn/*
+// @homepage     https://github.com/ntgmc/sysu-lms-assistant
+// @supportURL   https://github.com/ntgmc/sysu-lms-assistant/issues
 // @grant        none
+// @license      GPL-3.0 License
 // ==/UserScript==
 
 (function() {
