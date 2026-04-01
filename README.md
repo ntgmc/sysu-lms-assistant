@@ -28,7 +28,7 @@
 
 **方式 A：直接安装（推荐）**
 点击以下链接即可直接唤起 Tampermonkey 进行安装：
-👉 **[点击这里安装脚本](脚本的Raw链接，例如：https://raw.githubusercontent.com/ntgmc/sysu-lms-assistant/main/lms-script.user.js)**
+👉 **[点击这里安装脚本](https://raw.githubusercontent.com/ntgmc/sysu-lms-assistant/main/lms-script.user.js)**
 
 **方式 B：手动复制**
 1. 复制仓库中 `lms-script.user.js` 的所有代码。
