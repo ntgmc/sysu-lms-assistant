@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         中山大学 LMS 自动播放
 // @namespace    https://github.com/ntgmc/sysu-lms-assistant
-// @version      1.5
+// @version      1.6
 // @description  自动播放LMS视频，自动切超清防止无法播放，进度100%自动下一页。若视频播完但进度未满则自动重播。遇讨论页跳过。含悬浮控制与Toast提示。
 // @author       ntgmc
 // @match        *://lms.sysu.edu.cn/*
@@ -15,8 +15,8 @@
     'use strict';
 
     // ================= 配置项 =================
-    const CHECK_INTERVAL = 3000;      // 每3秒检查一次状态
-    const DELAY_BEFORE_NEXT = 3000;   // 视频完成（或进度100%）后等待3秒再跳转
+    const CHECK_INTERVAL = 1000;      // 每1秒检查一次状态
+    const DELAY_BEFORE_NEXT = 1000;   // 视频完成（或进度100%）后等待1秒再跳转
     const SKIP_FORUM_DELAY = 2000;    // 遇到讨论页时，等待2秒再跳过
     // ==========================================
 
