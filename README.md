@@ -2,62 +2,75 @@
 
 [![JavaScript](https://img.shields.io/badge/Language-JavaScript-yellow.svg)](https://developer.mozilla.org/en-US/docs/Web/JavaScript)
 [![Tampermonkey](https://img.shields.io/badge/Extension-Tampermonkey-black.svg)](https://www.tampermonkey.net/)
-[![Version](https://img.shields.io/badge/Version-1.5-blue.svg)](#)
+[![Version](https://img.shields.io/badge/Version-1.6-blue.svg)](#)
 
-这是一个为 **中山大学 LMS (Learning Management System)** 编写的浏览器油猴脚本（Tampermonkey）。旨在优化视频课程观看体验，实现全自动的视频连播、画质切换、进度异常修复以及全局状态控制，让你解放双手。
+这是一个为 **中山大学 LMS (Learning Management System)** 编写的浏览器插件集。旨在优化视频课程观看体验，实现全自动的视频连播、画质切换、进度修复以及**可选的计时加速**功能。
+
+## 🚨 核心警示 (Risk Warning)
+
+**本仓库现在包含一个实验性加速脚本 `time-hacker.user.js`。**
+- **搭配使用**：该脚本可以与主脚本同时开启，大幅缩短非视频任务（如文档、页面停留）的统计时间。
+- **封号风险**：由于加速脚本修改了浏览器底层定时器，其产生的异常学习数据可能会被后台审计。**过度加速可能导致账号异常、进度被清零或封号。** 请务必根据实际情况谨慎选择是否安装，建议加速倍率控制在合理范围内。
+
+---
 
 ## ✨ 核心功能 (Features)
 
-- **▶️ 自动播放与防暂停**：进入页面自动静音播放（突破浏览器自动播放限制），检测到非人为暂停会自动恢复播放。
-- **⚙️ 自动超清画质**：自动检测并切换至“超清”画质，省去每次手动点击的烦恼。
-- **⏭️ 自动下一页**：视频进度达到 100% 或状态变更为“已完成”后，自动跳转至下一课件。
-- **🔄 进度防 Bug 重播**：如果视频已播完但系统进度未达到 100%（平台偶发 Bug），脚本会自动重播视频补全进度，直到任务真正完成才跳转。
-- **⏩ 自动跳过讨论区**：遇到无需停留的“讨论/论坛”页面，等待 2 秒后自动跳过。
-- **🎛️ 悬浮控制面板**：页面左侧带有全局控制按钮，支持一键“暂停/恢复”脚本。跨页面记忆运行状态。
-- **💬 优雅的 Toast 提示**：放弃原有的控制台输出，采用屏幕右下角仿系统级 Toast 弹窗，平滑动画，不打扰观看体验。
+### 1. 基础助手 (lms-script.user.js)
+- **▶️ 自动播放与防暂停**：进入页面自动静音播放，检测到非人为暂停会自动恢复。
+- **⚙️ 自动超清画质**：自动检测并切换至最高画质。
+- **⏭️ 自动下一页**：视频播完后自动跳转至下一课件。
+- **🔄 进度修复**：针对平台 Bug，若视频结束但进度未满 100%，将自动重播直至任务完成。
+- **🎛️ 控制面板**：左侧悬浮按钮，支持跨页面状态记忆，可一键暂停所有自动化逻辑。
+
+### 2. 计时加速器 (time-hacker.user.js) - [新]
+- **⚡ 毫秒级加速**：拦截并重写 `setInterval` 与 `setTimeout`，让页面计时器运行速度提升（默认 10 倍）。
+- **📄 缩短停留要求**：显著减少“必须在该页面停留 X 分钟”类任务的实际等待时间。
+- **🛡️ 稳定性优化**：内置最小延迟保护，防止因速度过快导致浏览器崩溃或页面加载逻辑错误。
+
+---
 
 ## 🛠️ 安装说明 (Installation)
 
 ### 第一步：安装脚本管理器
-请先在浏览器中安装用户脚本管理器扩展程序：
-- [Tampermonkey](https://www.tampermonkey.net/) (推荐)
-- [Violentmonkey](https://violentmonkey.github.io/)
+请先安装：[Tampermonkey](https://www.tampermonkey.net/) (推荐) 或 [Violentmonkey](https://violentmonkey.github.io/)。
 
-### 第二步：安装脚本
-有以下两种方式安装本脚本：
+### 第二步：选择安装脚本
+你可以根据需求安装以下一个或多个脚本：
 
-**方式 A：直接安装（推荐）**
-点击以下链接即可直接唤起 Tampermonkey 进行安装：
-👉 **[点击这里安装脚本](https://raw.githubusercontent.com/ntgmc/sysu-lms-assistant/main/lms-script.user.js)**
+| 脚本名称 | 功能描述 | 安装链接 |
+| :--- | :--- | :--- |
+| **LMS 自动助手 (主脚本)** | 视频自动连播、画质控制、UI交互 | [👉 点击安装](https://raw.githubusercontent.com/ntgmc/sysu-lms-assistant/main/lms-script.user.js) |
+| **计时加速插件 (可选)** | 加速页面逻辑、缩短停留任务时长 | [👉 点击安装](https://raw.githubusercontent.com/ntgmc/sysu-lms-assistant/main/time-hacker.user.js) |
 
-**方式 B：手动复制**
-1. 复制仓库中 `lms-script.user.js` 的所有代码。
-2. 打开 Tampermonkey 面板，点击“添加新脚本”。
-3. 粘贴代码并保存 (`Ctrl+S` / `Cmd+S`)。
+> **提示**：建议两个脚本同时开启以获得最完整的自动化体验，但请阅读上方的风险提示。
+
+---
 
 ## 🚀 使用指南 (Usage)
 
-1. 安装完成后，正常登录 `lms.sysu.edu.cn` 并进入任意视频课程页面。
-2. 页面左侧会出现一个 **“LMS助手: 运行中”** 的绿色悬浮按钮，右下角会弹出启动提示。
-3. 脚本将自动接管后续操作。
-4. 如果遇到想仔细看的视频或想手动答题，点击左侧按钮将其切换为 **“已暂停”** 状态（红色），脚本将完全停止干预。
+1. 安装完成后，登录 `lms.sysu.edu.cn` 进入课程。
+2. **状态指示**：
+   - 页面左侧出现 **“LMS助手: 运行中”** 绿色按钮，表示主脚本正常工作。
+   - 打开浏览器控制台 (`F12`)，若看到 `[TimerHook]` 字样，表示加速插件已生效。
+3. **手动干预**：如需手动答题或操作，点击左侧按钮切换为“已暂停”即可。
 
 ## 📝 更新日志 (Changelog)
 
+- **v1.6**
+  - 新增 `time-hacker.user.js`：支持 `setInterval/setTimeout` 劫持加速。
+  - 优化加速逻辑，增加 `document-start` 注入机制，确保脚本在页面最早期运行。
 - **v1.5** 
   - 修复平台进度 Bug：增加视频播完但进度未满 100% 时自动重播的机制。
 - **v1.4** 
-  - 新增屏幕右下角 Toast 消息提示，移除旧版控制台输出。
-  - 新增页面左侧悬浮启停按钮，并使用 `localStorage` 实现状态跨页面记忆。
-- **v1.3及之前** 
-  - 实现基础自动播放、自动超清、跳过讨论页与自动下一页功能。
+  - 新增屏幕右下角 Toast 消息提示与左侧悬浮启停按钮。
 
 ## ⚠️ 免责声明 (Disclaimer)
 
-1. 本脚本仅供**前端技术学习与交流使用**。
-2. 请合理安排学习时间，保证学习质量。过度依赖自动化工具可能导致错失关键知识点。
-3. 因使用本脚本导致的任何账号异常或学习进度问题，作者**不承担任何责任**。请自行斟酌风险。
+1. 本项目仅供**前端技术交流与个人辅助实验**使用。
+2. 使用本辅助工具（尤其是加速脚本）可能违反学校或平台的相关学习规定。
+3. **因使用本工具导致的任何账号封禁、进度清零、成绩异常等后果，作者概不负责。** 请在法律和规章制度允许的范围内合理使用。
 
 ## 🤝 参与贡献与反馈
 
-如果你在使用过程中遇到 Bug 或有新的功能建议，欢迎提交 [Issues](https://github.com/ntgmc/sysu-lms-assistant/issues) 或 Pull Requests。
+如果你在加速过程中发现某些页面加载异常，欢迎提交 [Issues](https://github.com/ntgmc/sysu-lms-assistant/issues)。
