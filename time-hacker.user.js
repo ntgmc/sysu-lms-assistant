@@ -3,7 +3,7 @@
 // @namespace    Violentmonkey Scripts
 // @match        https://lms.sysu.edu.cn/mod/fsresource/view.php*
 // @grant        none
-// @version      1.1
+// @version      1.2
 // @author       Your Name
 // @description  优化版：加速 setInterval 和 setTimeout，支持 document-start 注入，增加稳定性
 // @run-at       document-start
@@ -13,7 +13,7 @@
     'use strict';
 
     // === 配置区域 ===
-    const SPEED_UP_FACTOR = 10; // 加速倍率 (例如10倍)
+    const SPEED_UP_FACTOR = 50; // 加速倍率
     const MIN_DELAY = 10;       // 最小延迟(ms)，防止浏览器卡死
     // ================
 
