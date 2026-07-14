@@ -3,59 +3,170 @@
 // @namespace    Violentmonkey Scripts
 // @match        https://lms.sysu.edu.cn/mod/fsresource/view.php*
 // @grant        none
-// @version      1.2
-// @author       Your Name
-// @description  优化版：加速 setInterval 和 setTimeout，支持 document-start 注入，增加稳定性
+// @version      2.0.0
+// @author       ntgmc
+// @description  迁移兼容脚本：计时加速已合并到中山大学 LMS 助手，请改用统一脚本。
+// @homepage     https://github.com/ntgmc/sysu-lms-assistant
+// @supportURL   https://github.com/ntgmc/sysu-lms-assistant/issues
 // @run-at       document-start
+// @license      GPL-3.0 License
 // ==/UserScript==
 
 (function() {
     'use strict';
 
-    // === 配置区域 ===
-    const SPEED_UP_FACTOR = 50; // 加速倍率
-    const MIN_DELAY = 10;       // 最小延迟(ms)，防止浏览器卡死
-    // ================
+    const ASSISTANT_INSTANCE_KEY = '__SYSU_LMS_ASSISTANT_V2__';
+    const DISMISSED_KEY = 'sysu_lms_time_hacker_migration_dismissed';
+    const INSTALL_URL = 'https://raw.githubusercontent.com/ntgmc/sysu-lms-assistant/main/lms-script.user.js';
 
-    const log = (msg) => console.log(`[TimerHook] ${msg}`);
+    if (window[ASSISTANT_INSTANCE_KEY]) return;
 
-    /**
-     * 核心劫持函数
-     * @param {Function} original 原函数
-     * @param {string} name 函数名
-     */
-    function hookTimer(original, name) {
-        const proxy = function(handler, delay, ...args) {
-            let finalDelay = delay;
-
-            // 如果 delay 是数字，则进行加速
-            if (typeof delay === 'number' && delay > 0) {
-                finalDelay = Math.max(delay / SPEED_UP_FACTOR, MIN_DELAY);
-                // 只有当延迟较大时才打印日志，避免刷屏
-                if (delay > 500) {
-                    log(`${name} 劫持: ${delay}ms -> ${Math.floor(finalDelay)}ms`);
-                }
-            }
-
-            return original(handler, finalDelay, ...args);
-        };
-
-        // 简单的防检测：还原 toString
-        proxy.toString = () => original.toString();
-        return proxy;
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', showMigrationNotice, { once: true });
+    } else {
+        showMigrationNotice();
     }
 
-    // 劫持 setInterval
-    window.setInterval = hookTimer(window.setInterval, 'setInterval');
+    function isDismissed() {
+        try {
+            return window.localStorage.getItem(DISMISSED_KEY) === 'true';
+        } catch (error) {
+            return false;
+        }
+    }
 
-    // 劫持 setTimeout (很多插件用这个递归)
-    window.setTimeout = hookTimer(window.setTimeout, 'setTimeout');
+    function rememberDismissal() {
+        try {
+            window.localStorage.setItem(DISMISSED_KEY, 'true');
+        } catch (error) {
+            // The notice still closes for this page when storage is unavailable.
+        }
+    }
 
-    // 额外优化：解决“失去焦点暂停”的问题
-    // 很多学习平台会在切换标签页时停止计时，通过覆盖 visibilityState 解决
-    Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
-    Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
+    function showMigrationNotice() {
+        if (window[ASSISTANT_INSTANCE_KEY] || isDismissed() || !document.body) return;
 
-    log("定时器加速脚本已注入，当前倍率: " + SPEED_UP_FACTOR);
+        const host = document.createElement('div');
+        host.id = 'sysu-lms-time-hacker-migration';
+        host.style.cssText = [
+            'position: fixed',
+            'right: 16px',
+            'bottom: 16px',
+            'z-index: 2147482999'
+        ].join(';');
 
+        const shadow = host.attachShadow({ mode: 'open' });
+        shadow.innerHTML = `
+            <style>
+                :host {
+                    color-scheme: light dark;
+                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+                }
+
+                * {
+                    box-sizing: border-box;
+                }
+
+                .notice {
+                    width: min(360px, calc(100vw - 32px));
+                    padding: 16px;
+                    border: 1px solid #f59e0b;
+                    border-radius: 14px;
+                    background: #ffffff;
+                    color: #0f172a;
+                    box-shadow: 0 16px 40px rgba(15, 23, 42, 0.2);
+                }
+
+                .title {
+                    margin: 0;
+                    font-size: 15px;
+                    font-weight: 700;
+                    line-height: 1.4;
+                }
+
+                .message {
+                    margin: 8px 0 14px;
+                    color: #475569;
+                    font-size: 13px;
+                    line-height: 1.55;
+                }
+
+                .actions {
+                    display: flex;
+                    flex-wrap: wrap;
+                    justify-content: flex-end;
+                    gap: 8px;
+                }
+
+                a,
+                button {
+                    display: inline-flex;
+                    min-height: 44px;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 0 14px;
+                    border-radius: 9px;
+                    font: inherit;
+                    font-size: 13px;
+                    font-weight: 650;
+                    cursor: pointer;
+                }
+
+                a {
+                    border: 1px solid #0f766e;
+                    background: #0f766e;
+                    color: #ffffff;
+                    text-decoration: none;
+                }
+
+                button {
+                    border: 1px solid #cbd5e1;
+                    background: transparent;
+                    color: #334155;
+                }
+
+                a:focus-visible,
+                button:focus-visible {
+                    outline: 3px solid rgba(13, 148, 136, 0.4);
+                    outline-offset: 2px;
+                }
+
+                @media (prefers-color-scheme: dark) {
+                    .notice {
+                        background: #111827;
+                        color: #f8fafc;
+                    }
+
+                    .message {
+                        color: #cbd5e1;
+                    }
+
+                    button {
+                        border-color: #475569;
+                        color: #e2e8f0;
+                    }
+                }
+
+                @media (max-width: 480px) {
+                    .notice {
+                        width: calc(100vw - 24px);
+                    }
+                }
+            </style>
+            <section class="notice" role="status" aria-labelledby="migration-title">
+                <h2 class="title" id="migration-title">计时加速功能已合并</h2>
+                <p class="message">旧版加速器已停止修改页面计时器。请安装或更新“中山大学 LMS 助手”，之后可在统一控制面板中按需开启加速。</p>
+                <div class="actions">
+                    <button id="dismiss" type="button">不再提示</button>
+                    <a href="${INSTALL_URL}" target="_blank" rel="noopener noreferrer">安装统一脚本</a>
+                </div>
+            </section>
+        `;
+
+        shadow.getElementById('dismiss').addEventListener('click', () => {
+            rememberDismissal();
+            host.remove();
+        });
+        document.body.appendChild(host);
+    }
 })();
