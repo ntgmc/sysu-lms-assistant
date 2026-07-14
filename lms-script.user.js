@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         中山大学 LMS 助手
 // @namespace    https://github.com/ntgmc/sysu-lms-assistant
-// @version      2.0.0
-// @description  集成自动播放、自动下一页、进度修复、讨论页跳过与可选计时加速，并提供统一控制面板。
+// @version      2.1.0
+// @description  集成自动播放、自动下一页、进度修复、讨论任务自动完成与可选计时加速，并提供统一控制面板。
 // @author       ntgmc
 // @match        *://lms.sysu.edu.cn/*
 // @homepage     https://github.com/ntgmc/sysu-lms-assistant
@@ -15,14 +15,17 @@
 (function() {
     'use strict';
 
-    const VERSION = '2.0.0';
+    const VERSION = '2.1.0';
     const INSTANCE_KEY = '__SYSU_LMS_ASSISTANT_V2__';
     const STORAGE_KEY = 'sysu_lms_assistant_settings_v2';
     const LEGACY_RUNNING_KEY = 'lms_script_running';
     const RESOURCE_PATH = '/mod/fsresource/view.php';
     const CHECK_INTERVAL = 1000;
     const DELAY_BEFORE_NEXT = 1000;
-    const SKIP_FORUM_DELAY = 2000;
+    const FORUM_TASK_STORAGE_KEY = 'sysu_lms_forum_task_v1';
+    const FORUM_FORM_TIMEOUT = 10000;
+    const FORUM_VERIFICATION_DELAY = 3000;
+    const FORUM_TASK_MAX_AGE = 10 * 60 * 1000;
     const MIN_TIMER_DELAY = 10;
     const SPEED_FACTORS = Object.freeze([2, 5, 10, 25, 50]);
 
@@ -48,6 +51,8 @@
         autoNext: true,
         autoQuality: true,
         skipForum: true,
+        autoCompleteForum: false,
+        forumReplyTemplates: '同意|赞同|支持',
         timerAcceleration: false,
         speedFactor: 10,
         panelExpanded: false
@@ -58,6 +63,7 @@
         'autoNext',
         'autoQuality',
         'skipForum',
+        'autoCompleteForum',
         'timerAcceleration',
         'panelExpanded'
     ]);
@@ -112,6 +118,11 @@
                 if (SPEED_FACTORS.includes(parsed.speedFactor)) {
                     nextSettings.speedFactor = parsed.speedFactor;
                 }
+
+                if (typeof parsed.forumReplyTemplates === 'string'
+                    && parsed.forumReplyTemplates.length <= 1000) {
+                    nextSettings.forumReplyTemplates = parsed.forumReplyTemplates;
+                }
             } catch (error) {
                 settingsLoadIssue = true;
             }
@@ -132,6 +143,45 @@
             String(nextSettings.assistantEnabled)
         );
         return saved && legacySaved;
+    }
+
+    function parseForumReplyTemplates(value) {
+        if (typeof value !== 'string') return [];
+        return value.split('|').map((item) => item.trim()).filter(Boolean);
+    }
+
+    function chooseRandomItem(items) {
+        if (!Array.isArray(items) || items.length === 0) return null;
+        return items[Math.floor(Math.random() * items.length)];
+    }
+
+    function readForumTask() {
+        try {
+            const serialized = window.sessionStorage.getItem(FORUM_TASK_STORAGE_KEY);
+            if (serialized === null) return null;
+            const parsed = JSON.parse(serialized);
+            return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+        } catch (error) {
+            return null;
+        }
+    }
+
+    function writeForumTask(task) {
+        try {
+            window.sessionStorage.setItem(FORUM_TASK_STORAGE_KEY, JSON.stringify(task));
+            return true;
+        } catch (error) {
+            return false;
+        }
+    }
+
+    function clearForumTask() {
+        try {
+            window.sessionStorage.removeItem(FORUM_TASK_STORAGE_KEY);
+            return true;
+        } catch (error) {
+            return false;
+        }
     }
 
     function installTimerAcceleration() {
@@ -166,6 +216,17 @@
         const ui = createUI({
             getSettings: () => settings,
             onSettingChange: (key, value) => {
+                if (key === 'forumReplyTemplates'
+                    && (typeof value !== 'string' || value.length > 1000)) {
+                    ui.renderSettings();
+                    ui.showToast(
+                        'forum-template-too-long',
+                        '讨论回复模板不能超过 1000 个字符。',
+                        { tone: 'warning', duration: 5000 }
+                    );
+                    return false;
+                }
+
                 const previousSettings = settings;
                 settings = { ...settings, [key]: value };
                 const saved = saveSettings(settings, key === 'assistantEnabled');
@@ -209,7 +270,8 @@
                 settings = nextSettings;
                 window.location.reload();
                 return true;
-            }
+            },
+            onForumRetry: () => controller && controller.retryForumTask()
         });
 
         controller = createLmsController(ui);
@@ -226,7 +288,7 @@
         }
     }
 
-    function createUI({ getSettings, onSettingChange, onAccelerationApply }) {
+    function createUI({ getSettings, onSettingChange, onAccelerationApply, onForumRetry }) {
         const host = document.createElement('div');
         host.id = 'sysu-lms-assistant-root';
         host.style.cssText = [
@@ -266,6 +328,10 @@
                     box-sizing: border-box;
                 }
 
+                [hidden] {
+                    display: none !important;
+                }
+
                 button,
                 input,
                 select {
@@ -280,6 +346,7 @@
 
                 button:focus-visible,
                 select:focus-visible,
+                textarea:focus-visible,
                 input:focus-visible + .switch-track {
                     outline: 3px solid color-mix(in srgb, var(--sla-focus) 45%, transparent);
                     outline-offset: 2px;
@@ -505,6 +572,65 @@
                     color: var(--sla-text-muted);
                     font-size: 11px;
                     line-height: 1.4;
+                }
+
+                .forum-template-field {
+                    margin-top: 8px;
+                }
+
+                .template-input {
+                    display: block;
+                    width: 100%;
+                    min-height: 76px;
+                    margin-top: 7px;
+                    padding: 9px 10px;
+                    resize: vertical;
+                    border: 1px solid var(--sla-border);
+                    border-radius: 9px;
+                    background: var(--sla-surface);
+                    color: var(--sla-text);
+                    font-size: 13px;
+                    line-height: 1.5;
+                }
+
+                .template-input[aria-invalid="true"] {
+                    border-color: var(--sla-error);
+                }
+
+                .template-meta {
+                    display: flex;
+                    justify-content: space-between;
+                    gap: 10px;
+                    margin-top: 5px;
+                    color: var(--sla-text-muted);
+                    font-size: 11px;
+                    line-height: 1.45;
+                }
+
+                .field-error {
+                    margin: 5px 0 0;
+                    color: var(--sla-error);
+                    font-size: 11px;
+                    font-weight: 600;
+                    line-height: 1.45;
+                }
+
+                .retry-button {
+                    width: 100%;
+                    min-height: 44px;
+                    margin-top: 9px;
+                    border: 1px solid var(--sla-warning-border);
+                    border-radius: 10px;
+                    background: var(--sla-warning-bg);
+                    color: var(--sla-warning);
+                    font-size: 13px;
+                    font-weight: 700;
+                    cursor: pointer;
+                    transition: border-color 150ms ease-out, filter 150ms ease-out;
+                }
+
+                .retry-button:hover {
+                    filter: brightness(0.96);
                 }
 
                 .switch-label {
@@ -824,8 +950,21 @@
                             <label class="switch-label" aria-label="自动切换超清"><input class="switch-input" id="auto-quality" type="checkbox"><span class="switch-track" aria-hidden="true"></span></label>
                         </div>
                         <div class="setting-row">
-                            <div class="setting-copy"><label class="setting-name" for="skip-forum">自动跳过讨论页</label></div>
-                            <label class="switch-label" aria-label="自动跳过讨论页"><input class="switch-input" id="skip-forum" type="checkbox"><span class="switch-track" aria-hidden="true"></span></label>
+                            <div class="setting-copy">
+                                <label class="setting-name" for="auto-complete-forum">自动完成讨论任务</label>
+                                <span class="setting-help">会真实发表公开回复，并验证平台完成状态</span>
+                            </div>
+                            <label class="switch-label" aria-label="自动完成讨论任务"><input class="switch-input" id="auto-complete-forum" type="checkbox"><span class="switch-track" aria-hidden="true"></span></label>
+                        </div>
+                        <div class="forum-template-field">
+                            <label class="setting-name" for="forum-reply-templates">随机回复模板</label>
+                            <textarea class="template-input" id="forum-reply-templates" maxlength="1000" rows="3" aria-describedby="forum-template-help forum-template-count forum-template-error"></textarea>
+                            <div class="template-meta">
+                                <span id="forum-template-help">使用 | 分隔多条候选，提交时随机选择</span>
+                                <span id="forum-template-count">0 条候选</span>
+                            </div>
+                            <p class="field-error" id="forum-template-error" role="alert" hidden>至少需要一条非空回复内容。</p>
+                            <button class="retry-button" id="retry-forum-task" type="button" hidden>重试讨论任务</button>
                         </div>
                     </section>
 
@@ -879,6 +1018,9 @@
             statusAction: shadow.getElementById('status-action'),
             pageType: shadow.getElementById('page-type'),
             toastContainer: shadow.getElementById('toast-container'),
+            forumTemplateCount: shadow.getElementById('forum-template-count'),
+            forumTemplateError: shadow.getElementById('forum-template-error'),
+            retryForumTask: shadow.getElementById('retry-forum-task'),
             accelerationHelp: shadow.getElementById('acceleration-state-help'),
             accelerationNote: shadow.getElementById('acceleration-page-note'),
             applyAcceleration: shadow.getElementById('apply-acceleration'),
@@ -887,7 +1029,8 @@
                 autoPlay: shadow.getElementById('auto-play'),
                 autoNext: shadow.getElementById('auto-next'),
                 autoQuality: shadow.getElementById('auto-quality'),
-                skipForum: shadow.getElementById('skip-forum'),
+                autoCompleteForum: shadow.getElementById('auto-complete-forum'),
+                forumReplyTemplates: shadow.getElementById('forum-reply-templates'),
                 timerAcceleration: shadow.getElementById('timer-acceleration'),
                 speedFactor: shadow.getElementById('speed-factor')
             }
@@ -926,7 +1069,8 @@
         });
 
         Object.entries(refs.inputs).forEach(([key, input]) => {
-            if (key === 'timerAcceleration' || key === 'speedFactor') return;
+            if (key === 'timerAcceleration' || key === 'speedFactor'
+                || key === 'forumReplyTemplates') return;
             input.addEventListener('change', () => {
                 const value = input.type === 'checkbox' ? input.checked : input.value;
                 if (!onSettingChange(key, value)) return;
@@ -940,6 +1084,23 @@
                 }
                 renderSettings(false);
             });
+        });
+
+        refs.inputs.forumReplyTemplates.addEventListener('input', () => {
+            renderForumTemplateState(refs.inputs.forumReplyTemplates.value);
+        });
+        refs.inputs.forumReplyTemplates.addEventListener('change', () => {
+            const value = refs.inputs.forumReplyTemplates.value;
+            if (!onSettingChange('forumReplyTemplates', value)) return;
+            renderForumTemplateState(value);
+        });
+        refs.retryForumTask.addEventListener('click', () => {
+            const currentTemplateValue = refs.inputs.forumReplyTemplates.value;
+            if (currentTemplateValue !== getSettings().forumReplyTemplates
+                && !onSettingChange('forumReplyTemplates', currentTemplateValue)) {
+                return;
+            }
+            onForumRetry();
         });
 
         refs.inputs.timerAcceleration.addEventListener('change', () => {
@@ -975,6 +1136,10 @@
             refs.shell.dataset.expanded = String(currentSettings.panelExpanded);
             refs.panel.setAttribute('aria-hidden', String(!currentSettings.panelExpanded));
             refs.trigger.setAttribute('aria-expanded', String(currentSettings.panelExpanded));
+            if (shadow.activeElement !== refs.inputs.forumReplyTemplates) {
+                refs.inputs.forumReplyTemplates.value = currentSettings.forumReplyTemplates;
+            }
+            renderForumTemplateState(refs.inputs.forumReplyTemplates.value);
             renderAccelerationState();
 
             if (!currentSettings.assistantEnabled) {
@@ -998,6 +1163,22 @@
                     ? `当前页面已启用 ${currentSettings.speedFactor}× 加速。`
                     : '当前为资源停留页；应用设置后会自动刷新。')
                 : '仅在资源停留页生效，其他 LMS 页面不会修改计时器。';
+        }
+
+        function renderForumTemplateState(value) {
+            const candidates = parseForumReplyTemplates(value);
+            const isValid = candidates.length > 0;
+            refs.forumTemplateCount.textContent = `${candidates.length} 条候选`;
+            refs.forumTemplateError.hidden = isValid;
+            refs.inputs.forumReplyTemplates.setAttribute('aria-invalid', String(!isValid));
+        }
+
+        function setForumRetryVisible(visible) {
+            refs.retryForumTask.hidden = !visible;
+        }
+
+        function isForumTemplateEditing() {
+            return shadow.activeElement === refs.inputs.forumReplyTemplates;
         }
 
         function setStatus(tone, label, action) {
@@ -1047,6 +1228,8 @@
             setStatus,
             setAction,
             setPageType,
+            setForumRetryVisible,
+            isForumTemplateEditing,
             showToast
         };
     }
@@ -1061,7 +1244,13 @@
             intervalId: null,
             lastErrorAt: 0,
             videoHandlers: null,
-            forumNoticeShown: false,
+            forumVerificationScheduled: false,
+            forumFormWaitStartedAt: 0,
+            forumSubmitStartedAt: 0,
+            forumAutomationBlocked: false,
+            forumRetryAllowed: false,
+            lastForumFailureCode: null,
+            lastForumFailureMessage: '',
             retryInteractionCleanup: null
         };
 
@@ -1085,10 +1274,19 @@
                 state.hasSetQuality = false;
             }
 
+            if (key === 'autoCompleteForum' && !settings.autoCompleteForum) {
+                clearForumTask();
+                resetForumRuntimeState();
+            }
+
             if (key === 'assistantEnabled') {
                 updateBaseStatus();
             } else if (key !== 'panelExpanded') {
                 ui.setAction('设置已保存，将在当前页面即时生效');
+            }
+
+            if (key === 'autoCompleteForum' || key === 'forumReplyTemplates') {
+                nativeTimers.setTimeout(checkPage, 0);
             }
         }
 
@@ -1109,13 +1307,24 @@
                 if (state.hasNavigated) return;
 
                 const nextLink = document.getElementById('next-activity-link');
-                const isForumPage = window.location.href.includes('/mod/forum/view.php')
-                    || document.body.id === 'page-mod-forum-view';
+                const isForumPostPage = window.location.pathname === '/mod/forum/post.php'
+                    && /^\d+$/.test(new URL(window.location.href).searchParams.get('reply') || '');
+                const isForumPage = window.location.pathname === '/mod/forum/view.php'
+                    || window.location.pathname === '/mod/forum/discuss.php'
+                    || document.body.id === 'page-mod-forum-view'
+                    || document.body.id === 'page-mod-forum-discuss';
 
-                if (isForumPage) {
-                    handleForumPage(nextLink);
+                if (isForumPostPage) {
+                    handleForumPostPage();
                     return;
                 }
+
+                if (isForumPage) {
+                    handleForumDiscussionPage(nextLink);
+                    return;
+                }
+
+                ui.setForumRetryVisible(false);
 
                 const video = document.querySelector('video');
                 attachVideo(video);
@@ -1150,33 +1359,566 @@
             }
         }
 
-        function handleForumPage(nextLink) {
+        function handleForumDiscussionPage(nextLink) {
             ui.setPageType('讨论页');
 
-            if (!settings.skipForum) {
-                ui.setStatus('active', '运行中', '已关闭讨论页自动跳过');
+            if (!settings.autoCompleteForum) {
+                clearForumTask();
+                resetForumRuntimeState();
+                ui.setStatus('active', '等待手动操作', '讨论任务自动完成默认关闭');
                 return;
             }
 
-            if (!nextLink) {
-                ui.setStatus('warning', '需要手动操作', '讨论页没有可用的下一页链接');
-                if (!state.forumNoticeShown) {
-                    state.forumNoticeShown = true;
-                    ui.showToast(
-                        'forum-no-next',
-                        '检测到讨论页，但没有找到下一页链接。',
-                        { tone: 'warning', duration: 5000 }
+            if (ui.isForumTemplateEditing()) {
+                ui.setStatus('active', '正在编辑设置', '保存回复模板后继续处理讨论任务');
+                return;
+            }
+
+            const requirement = getForumCompletionRequirement();
+            if (requirement.completed) {
+                completeForumTask(nextLink);
+                return;
+            }
+
+            if (state.forumAutomationBlocked) {
+                ui.setStatus('error', '讨论任务失败', state.lastForumFailureMessage);
+                ui.setForumRetryVisible(state.forumRetryAllowed);
+                return;
+            }
+
+            if (!requirement.recognized) {
+                blockForumTask(
+                    'unsupported-requirement',
+                    '未识别到“发表论坛帖子”完成要求，请手动处理。',
+                    { retry: false }
+                );
+                return;
+            }
+
+            const templates = parseForumReplyTemplates(settings.forumReplyTemplates);
+            if (templates.length === 0) {
+                showForumTemplateError();
+                return;
+            }
+
+            let task = readForumTask();
+            if (task && !isValidForumTask(task)) {
+                if (!clearForumTask()) {
+                    blockForumTask(
+                        'invalid-task-clear-failed',
+                        '讨论待办已损坏且无法清除，已停止自动操作。',
+                        { retry: false }
+                    );
+                    return;
+                }
+                task = null;
+            }
+
+            if (task && !isTaskForCurrentDiscussion(task)) {
+                blockForumTask(
+                    'activity-mismatch',
+                    '讨论待办与当前活动不匹配，为防止误发已停止。',
+                    { task }
+                );
+                return;
+            }
+
+            if (task) {
+                if (Date.now() - task.startedAt > FORUM_TASK_MAX_AGE) {
+                    blockForumTask('task-expired', '讨论任务等待已超过 10 分钟，请手动重试。', { task });
+                    return;
+                }
+
+                if (task.phase === 'failed') {
+                    blockForumTask(
+                        task.errorCode || 'previous-failure',
+                        '上次自动回复未能确认完成，请检查页面后重试。',
+                        { task }
+                    );
+                    return;
+                }
+
+                if (task.phase === 'attempted') {
+                    verifyForumCompletion(task, nextLink);
+                    return;
+                }
+
+                blockForumTask(
+                    'reply-navigation-incomplete',
+                    '回复页面未能正常打开，为防止重复发帖已停止。',
+                    { task }
+                );
+                return;
+            }
+
+            startForumReply(templates);
+        }
+
+        function getForumCompletionRequirement() {
+            const candidates = Array.from(document.querySelectorAll(
+                '[data-region="completionrequirements"] [role="listitem"], .automatic-completion-conditions .badge'
+            ));
+            const element = candidates.find((candidate) => candidate.textContent.includes('发表论坛帖子'));
+            if (!element) return { recognized: false, completed: false, element: null };
+
+            const strongText = element.querySelector('strong')?.textContent.trim() || '';
+            const hasCheckedIcon = Boolean(element.querySelector('img[src*="/i/checked"]'));
+            const completed = element.classList.contains('alert-success')
+                || strongText === '完成'
+                || hasCheckedIcon;
+            return { recognized: true, completed, element };
+        }
+
+        function getForumActivityId() {
+            const url = new URL(window.location.href);
+            const activityId = url.searchParams.get('id');
+            if (/^\d+$/.test(activityId || '')) return activityId;
+            const discussionId = url.searchParams.get('d');
+            return /^\d+$/.test(discussionId || '') ? `d:${discussionId}` : null;
+        }
+
+        function getForumDiscussionId() {
+            const currentUrl = new URL(window.location.href);
+            const currentDiscussionId = currentUrl.searchParams.get('d');
+            if (/^\d+$/.test(currentDiscussionId || '')) return currentDiscussionId;
+
+            const links = document.querySelectorAll('a[href*="/mod/forum/discuss.php?d="]');
+            for (const link of links) {
+                try {
+                    const url = new URL(link.href, currentUrl.href);
+                    const discussionId = url.searchParams.get('d');
+                    if (url.origin === currentUrl.origin
+                        && url.pathname === '/mod/forum/discuss.php'
+                        && /^\d+$/.test(discussionId || '')) {
+                        return discussionId;
+                    }
+                } catch (error) {
+                    // Ignore malformed host-page links and continue searching.
+                }
+            }
+            return null;
+        }
+
+        function getNormalizedPageUrl() {
+            const url = new URL(window.location.href);
+            return `${url.origin}${url.pathname}${url.search}`;
+        }
+
+        function isValidForumTask(task) {
+            return typeof task.activityId === 'string'
+                && typeof task.sourceUrl === 'string'
+                && /^\d+$/.test(String(task.replyPostId || ''))
+                && typeof task.replyText === 'string'
+                && task.replyText.trim().length > 0
+                && ['opening', 'attempted', 'failed'].includes(task.phase)
+                && typeof task.verifyReloaded === 'boolean'
+                && Number.isFinite(task.startedAt)
+                && (task.discussionId === null
+                    || task.discussionId === undefined
+                    || /^\d+$/.test(String(task.discussionId)));
+        }
+
+        function isTaskForCurrentDiscussion(task) {
+            try {
+                const currentUrl = new URL(window.location.href);
+                const sourceUrl = new URL(task.sourceUrl);
+                if (sourceUrl.origin !== currentUrl.origin) return false;
+
+                if (sourceUrl.pathname === currentUrl.pathname) {
+                    return task.activityId === getForumActivityId();
+                }
+
+                return task.phase === 'attempted'
+                    && currentUrl.pathname === '/mod/forum/discuss.php'
+                    && typeof task.discussionId === 'string'
+                    && task.discussionId === getForumDiscussionId();
+            } catch (error) {
+                return false;
+            }
+        }
+
+        function getReplyTargets() {
+            const links = Array.from(document.querySelectorAll(
+                'a[data-action="collapsible-link"][href*="/mod/forum/post.php?reply="]'
+            ));
+            const targets = links.flatMap((element) => {
+                try {
+                    const url = new URL(element.href, window.location.href);
+                    const replyPostId = url.searchParams.get('reply');
+                    if (url.origin !== window.location.origin
+                        || url.pathname !== '/mod/forum/post.php'
+                        || !/^\d+$/.test(replyPostId || '')) {
+                        return [];
+                    }
+                    return [{ element, url, replyPostId }];
+                } catch (error) {
+                    return [];
+                }
+            });
+            const ordinaryTargets = targets.filter(({ element }) => !element.closest('.firstpost.starter'));
+            return ordinaryTargets.length > 0 ? ordinaryTargets : targets;
+        }
+
+        function startForumReply(templates) {
+            const activityId = getForumActivityId();
+            if (!activityId) {
+                blockForumTask(
+                    'missing-activity-id',
+                    '无法识别当前讨论活动编号，请手动处理。',
+                    { retry: false }
+                );
+                return;
+            }
+
+            const target = chooseRandomItem(getReplyTargets());
+            if (!target) {
+                blockForumTask('missing-reply-link', '当前讨论没有可用的回复入口。');
+                return;
+            }
+
+            const replyText = chooseRandomItem(templates);
+            const task = {
+                activityId,
+                discussionId: getForumDiscussionId(),
+                sourceUrl: getNormalizedPageUrl(),
+                replyPostId: target.replyPostId,
+                replyText,
+                phase: 'opening',
+                verifyReloaded: false,
+                startedAt: Date.now(),
+                errorCode: null
+            };
+
+            if (!writeForumTask(task)) {
+                blockForumTask(
+                    'session-storage-unavailable',
+                    '无法保存防重复状态，已取消自动回复。'
+                );
+                return;
+            }
+
+            ui.setForumRetryVisible(false);
+            ui.setStatus('active', '正在打开回复页', '已选择回复内容，正在进入 Moodle 原生表单');
+            ui.showToast('forum-opening-reply', '正在打开讨论回复页面。');
+            state.hasNavigated = true;
+            window.location.assign(target.url.href);
+        }
+
+        function verifyForumCompletion(task, nextLink) {
+            if (task.verifyReloaded) {
+                blockForumTask(
+                    'completion-unconfirmed',
+                    '平台刷新后仍未确认讨论完成，为防止重复发帖已停止。',
+                    { task }
+                );
+                return;
+            }
+
+            ui.setForumRetryVisible(false);
+            ui.setStatus('active', '等待平台确认', '正在等待“发表论坛帖子”完成状态更新');
+            if (state.forumVerificationScheduled) return;
+            state.forumVerificationScheduled = true;
+
+            nativeTimers.setTimeout(() => {
+                state.forumVerificationScheduled = false;
+                if (!settings.assistantEnabled || !settings.autoCompleteForum) return;
+
+                const latestTask = readForumTask();
+                if (!latestTask || latestTask.phase !== 'attempted') return;
+
+                const latestRequirement = getForumCompletionRequirement();
+                if (latestRequirement.recognized && latestRequirement.completed) {
+                    completeForumTask(nextLink);
+                    return;
+                }
+
+                const updatedTask = { ...latestTask, verifyReloaded: true };
+                if (!writeForumTask(updatedTask)) {
+                    blockForumTask(
+                        'verification-state-save-failed',
+                        '无法保存完成验证状态，已停止自动操作。',
+                        { task: latestTask }
+                    );
+                    return;
+                }
+
+                state.hasNavigated = true;
+                window.location.reload();
+            }, FORUM_VERIFICATION_DELAY);
+        }
+
+        function completeForumTask(nextLink) {
+            clearForumTask();
+            resetForumRuntimeState();
+
+            if (nextLink && settings.autoNext) {
+                scheduleNavigation(
+                    nextLink,
+                    DELAY_BEFORE_NEXT,
+                    `讨论任务已完成，${DELAY_BEFORE_NEXT / 1000} 秒后进入下一页。`,
+                    'forum-complete'
+                );
+            } else if (!nextLink) {
+                ui.setStatus('complete', '已完成', '讨论任务已完成，当前为最后一节');
+                ui.showToast(
+                    'forum-last-activity',
+                    '讨论任务已完成，当前为最后一节。',
+                    { tone: 'success', duration: 5000 }
+                );
+                stop();
+            } else {
+                ui.setStatus('complete', '已完成', '自动下一页已关闭，请手动继续');
+            }
+        }
+
+        function showForumTemplateError() {
+            ui.setForumRetryVisible(false);
+            ui.setStatus('warning', '需要设置回复', '随机回复模板至少需要一条非空内容');
+            if (state.lastForumFailureCode !== 'empty-template') {
+                state.lastForumFailureCode = 'empty-template';
+                ui.showToast(
+                    'forum-empty-template',
+                    '讨论回复模板为空，请在控制面板中填写后重试。',
+                    { tone: 'warning', duration: 5000 }
+                );
+            }
+        }
+
+        function handleForumPostPage() {
+            ui.setPageType('讨论回复页');
+
+            if (!settings.autoCompleteForum) {
+                clearForumTask();
+                resetForumRuntimeState();
+                ui.setStatus('active', '等待手动操作', '讨论任务自动完成已关闭');
+                return;
+            }
+
+            if (state.forumAutomationBlocked) {
+                ui.setStatus('error', '讨论任务失败', state.lastForumFailureMessage);
+                ui.setForumRetryVisible(state.forumRetryAllowed);
+                return;
+            }
+
+            const task = readForumTask();
+            if (!task || !isValidForumTask(task)) {
+                blockForumTask(
+                    'missing-pending-task',
+                    '未找到有效的讨论回复待办，请返回讨论页后重试。'
+                );
+                return;
+            }
+
+            if (Date.now() - task.startedAt > FORUM_TASK_MAX_AGE) {
+                blockForumTask('task-expired', '讨论任务等待已超过 10 分钟，请手动重试。', { task });
+                return;
+            }
+
+            const replyPostId = new URL(window.location.href).searchParams.get('reply');
+            if (replyPostId !== String(task.replyPostId)) {
+                blockForumTask('reply-target-mismatch', '回复目标与待办记录不一致，已停止提交。', { task });
+                return;
+            }
+
+            if (task.phase === 'failed') {
+                blockForumTask(
+                    task.errorCode || 'previous-failure',
+                    '上次自动回复失败，请检查页面后重试。',
+                    { task }
+                );
+                return;
+            }
+
+            if (task.phase === 'attempted') {
+                if (state.forumSubmitStartedAt > 0
+                    && Date.now() - state.forumSubmitStartedAt < FORUM_FORM_TIMEOUT) {
+                    ui.setForumRetryVisible(false);
+                    ui.setStatus('active', '正在提交回复', '等待 Moodle 接收并返回讨论页');
+                } else {
+                    blockForumTask(
+                        'submit-did-not-navigate',
+                        '回复提交后页面未正常返回，为防止重复发帖已停止。',
+                        { task }
                     );
                 }
                 return;
             }
 
-            scheduleNavigation(
-                nextLink,
-                SKIP_FORUM_DELAY,
-                `检测到讨论页，${SKIP_FORUM_DELAY / 1000} 秒后自动跳过。`,
-                'forum-skip'
+            if (state.forumFormWaitStartedAt === 0) {
+                state.forumFormWaitStartedAt = Date.now();
+            }
+
+            const form = document.querySelector('form#mformforum');
+            if (!form) {
+                if (Date.now() - state.forumFormWaitStartedAt < FORUM_FORM_TIMEOUT) {
+                    ui.setForumRetryVisible(false);
+                    ui.setStatus('active', '等待回复表单', '正在等待 Moodle 加载原生回复表单');
+                    return;
+                }
+                blockForumTask('reply-form-missing', '等待 10 秒后仍未找到 Moodle 回复表单。', { task });
+                return;
+            }
+
+            const textarea = findForumTextarea(form);
+            const contentEditable = form.querySelector(
+                '[contenteditable="true"][role="textbox"], [contenteditable="true"]'
             );
+            if (!textarea && !contentEditable) {
+                if (Date.now() - state.forumFormWaitStartedAt < FORUM_FORM_TIMEOUT) {
+                    ui.setStatus('active', '等待回复编辑器', '正在等待 Moodle 初始化回复编辑器');
+                    return;
+                }
+                blockForumTask('reply-editor-missing', '未找到兼容的 Moodle 回复编辑器。', { task });
+                return;
+            }
+
+            const submitButton = findForumSubmitButton(form);
+            if (!submitButton) {
+                if (Date.now() - state.forumFormWaitStartedAt < FORUM_FORM_TIMEOUT) {
+                    ui.setStatus('active', '等待提交按钮', '正在等待 Moodle 初始化发表按钮');
+                    return;
+                }
+                blockForumTask('reply-submit-missing', '未找到兼容的 Moodle 发表按钮。', { task });
+                return;
+            }
+
+            if (submitButton.disabled || submitButton.getAttribute('aria-disabled') === 'true') {
+                if (Date.now() - state.forumFormWaitStartedAt < FORUM_FORM_TIMEOUT) {
+                    ui.setStatus('active', '等待提交按钮', 'Moodle 仍在初始化发表按钮');
+                    return;
+                }
+                blockForumTask('reply-submit-disabled', 'Moodle 发表按钮持续不可用。', { task });
+                return;
+            }
+
+            fillForumReply(textarea, contentEditable, task.replyText);
+            const attemptedTask = { ...task, phase: 'attempted', errorCode: null };
+            if (!writeForumTask(attemptedTask)) {
+                blockForumTask(
+                    'attempt-state-save-failed',
+                    '无法保存已提交状态，为防止重复发帖已取消提交。',
+                    { task }
+                );
+                return;
+            }
+
+            state.forumSubmitStartedAt = Date.now();
+            ui.setForumRetryVisible(false);
+            ui.setStatus('active', '正在提交回复', '已填充随机回复，正在交由 Moodle 原生表单提交');
+            ui.showToast('forum-submitting', '正在提交讨论回复，请勿关闭页面。');
+
+            try {
+                if (typeof form.requestSubmit === 'function') {
+                    form.requestSubmit(submitButton);
+                } else {
+                    submitButton.click();
+                }
+            } catch (error) {
+                blockForumTask('reply-submit-error', 'Moodle 回复表单提交失败，请手动重试。', {
+                    task: attemptedTask
+                });
+                console.error('[SYSU LMS Assistant] Forum reply submission failed:', error);
+            }
+        }
+
+        function findForumTextarea(form) {
+            const selectors = [
+                'textarea[name="message[text]"]',
+                'textarea[name="message"]',
+                'textarea[name="post"]',
+                'textarea[data-region="post-content"]',
+                'textarea[id^="id_message"]'
+            ];
+            return selectors.map((selector) => form.querySelector(selector)).find(Boolean) || null;
+        }
+
+        function findForumSubmitButton(form) {
+            const preferred = form.querySelector(
+                '[data-action="forum-submit-post"], #id_submitbutton, [name="submitbutton"]'
+            );
+            if (preferred) return preferred;
+
+            return Array.from(form.querySelectorAll('button[type="submit"], input[type="submit"]'))
+                .find((element) => {
+                    const label = `${element.name || ''} ${element.value || ''} ${element.textContent || ''}`;
+                    return !/(cancel|取消|advanced|高级)/i.test(label);
+                }) || null;
+        }
+
+        function fillForumReply(textarea, contentEditable, replyText) {
+            if (textarea) {
+                textarea.value = replyText;
+                textarea.dispatchEvent(new Event('input', { bubbles: true }));
+                textarea.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+            if (contentEditable) {
+                contentEditable.textContent = replyText;
+                contentEditable.dispatchEvent(new Event('input', { bubbles: true }));
+                contentEditable.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+        }
+
+        function blockForumTask(code, message, { task = readForumTask(), retry = true } = {}) {
+            if (task && isValidForumTask(task)) {
+                writeForumTask({ ...task, phase: 'failed', errorCode: code });
+            }
+
+            state.forumAutomationBlocked = true;
+            state.forumRetryAllowed = retry;
+            state.forumVerificationScheduled = false;
+            state.lastForumFailureMessage = message;
+            ui.setForumRetryVisible(retry);
+            ui.setStatus('error', '讨论任务失败', message);
+
+            if (state.lastForumFailureCode !== code) {
+                state.lastForumFailureCode = code;
+                const recoveryMessage = retry ? `${message} 可在控制面板中重试。` : message;
+                ui.showToast(`forum-failure-${code}`, recoveryMessage, {
+                    tone: 'error',
+                    duration: 5000
+                });
+            }
+        }
+
+        function resetForumRuntimeState() {
+            state.forumVerificationScheduled = false;
+            state.forumFormWaitStartedAt = 0;
+            state.forumSubmitStartedAt = 0;
+            state.forumAutomationBlocked = false;
+            state.forumRetryAllowed = false;
+            state.lastForumFailureCode = null;
+            state.lastForumFailureMessage = '';
+            ui.setForumRetryVisible(false);
+        }
+
+        function retryForumTask() {
+            const task = readForumTask();
+            const sourceUrl = task?.sourceUrl || null;
+            if (!clearForumTask()) {
+                blockForumTask(
+                    'retry-state-clear-failed',
+                    '无法清除旧的防重复状态，已取消重试。'
+                );
+                return;
+            }
+
+            resetForumRuntimeState();
+            ui.setStatus('active', '准备重试', '正在重新选择回复目标和内容');
+
+            if (window.location.pathname === '/mod/forum/post.php' && sourceUrl) {
+                try {
+                    const url = new URL(sourceUrl);
+                    if (url.origin !== window.location.origin) throw new TypeError('Cross-origin source URL.');
+                    state.hasNavigated = true;
+                    window.location.assign(url.href);
+                    return;
+                } catch (error) {
+                    blockForumTask('invalid-source-url', '原讨论页地址无效，无法自动返回。');
+                    return;
+                }
+            }
+
+            nativeTimers.setTimeout(checkPage, 0);
         }
 
         function handleQuality() {
@@ -1377,7 +2119,8 @@
         return {
             start,
             stop,
-            handleSettingChange
+            handleSettingChange,
+            retryForumTask
         };
     }
 })();
