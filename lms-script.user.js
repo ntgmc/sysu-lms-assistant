@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         中山大学 LMS 助手
 // @namespace    https://github.com/ntgmc/sysu-lms-assistant
-// @version      2.1.0
-// @description  集成自动播放、自动下一页、进度修复、讨论任务自动完成与可选计时加速，并提供统一控制面板。
+// @version      2.1.1
+// @description  集成自动播放、自动下一页、进度修复、讨论页跳过、讨论任务自动完成与可选计时加速，并提供统一控制面板。
 // @author       ntgmc
 // @match        *://lms.sysu.edu.cn/*
 // @homepage     https://github.com/ntgmc/sysu-lms-assistant
@@ -15,13 +15,14 @@
 (function() {
     'use strict';
 
-    const VERSION = '2.1.0';
+    const VERSION = '2.1.1';
     const INSTANCE_KEY = '__SYSU_LMS_ASSISTANT_V2__';
     const STORAGE_KEY = 'sysu_lms_assistant_settings_v2';
     const LEGACY_RUNNING_KEY = 'lms_script_running';
     const RESOURCE_PATH = '/mod/fsresource/view.php';
     const CHECK_INTERVAL = 1000;
     const DELAY_BEFORE_NEXT = 1000;
+    const SKIP_FORUM_DELAY = 2000;
     const FORUM_TASK_STORAGE_KEY = 'sysu_lms_forum_task_v1';
     const FORUM_FORM_TIMEOUT = 10000;
     const FORUM_VERIFICATION_DELAY = 3000;
@@ -951,8 +952,15 @@
                         </div>
                         <div class="setting-row">
                             <div class="setting-copy">
+                                <label class="setting-name" for="skip-forum">自动跳过讨论页</label>
+                                <span class="setting-help">不发表回复，直接进入下一项活动</span>
+                            </div>
+                            <label class="switch-label" aria-label="自动跳过讨论页"><input class="switch-input" id="skip-forum" type="checkbox"><span class="switch-track" aria-hidden="true"></span></label>
+                        </div>
+                        <div class="setting-row">
+                            <div class="setting-copy">
                                 <label class="setting-name" for="auto-complete-forum">自动完成讨论任务</label>
-                                <span class="setting-help">会真实发表公开回复，并验证平台完成状态</span>
+                                <span class="setting-help">优先于跳过；会真实发表公开回复并验证完成状态</span>
                             </div>
                             <label class="switch-label" aria-label="自动完成讨论任务"><input class="switch-input" id="auto-complete-forum" type="checkbox"><span class="switch-track" aria-hidden="true"></span></label>
                         </div>
@@ -1029,6 +1037,7 @@
                 autoPlay: shadow.getElementById('auto-play'),
                 autoNext: shadow.getElementById('auto-next'),
                 autoQuality: shadow.getElementById('auto-quality'),
+                skipForum: shadow.getElementById('skip-forum'),
                 autoCompleteForum: shadow.getElementById('auto-complete-forum'),
                 forumReplyTemplates: shadow.getElementById('forum-reply-templates'),
                 timerAcceleration: shadow.getElementById('timer-acceleration'),
@@ -1244,6 +1253,7 @@
             intervalId: null,
             lastErrorAt: 0,
             videoHandlers: null,
+            forumNoticeShown: false,
             forumVerificationScheduled: false,
             forumFormWaitStartedAt: 0,
             forumSubmitStartedAt: 0,
@@ -1285,7 +1295,8 @@
                 ui.setAction('设置已保存，将在当前页面即时生效');
             }
 
-            if (key === 'autoCompleteForum' || key === 'forumReplyTemplates') {
+            if (key === 'skipForum' || key === 'autoCompleteForum'
+                || key === 'forumReplyTemplates') {
                 nativeTimers.setTimeout(checkPage, 0);
             }
         }
@@ -1365,7 +1376,11 @@
             if (!settings.autoCompleteForum) {
                 clearForumTask();
                 resetForumRuntimeState();
-                ui.setStatus('active', '等待手动操作', '讨论任务自动完成默认关闭');
+                if (settings.skipForum) {
+                    handleForumSkip(nextLink);
+                    return;
+                }
+                ui.setStatus('active', '等待手动操作', '讨论页跳过和任务自动完成均已关闭');
                 return;
             }
 
@@ -1452,6 +1467,30 @@
             }
 
             startForumReply(templates);
+        }
+
+        function handleForumSkip(nextLink) {
+            ui.setForumRetryVisible(false);
+
+            if (!nextLink) {
+                ui.setStatus('warning', '需要手动操作', '讨论页没有可用的下一页链接');
+                if (!state.forumNoticeShown) {
+                    state.forumNoticeShown = true;
+                    ui.showToast(
+                        'forum-no-next',
+                        '检测到讨论页，但没有找到下一页链接。',
+                        { tone: 'warning', duration: 5000 }
+                    );
+                }
+                return;
+            }
+
+            scheduleNavigation(
+                nextLink,
+                SKIP_FORUM_DELAY,
+                `检测到讨论页，${SKIP_FORUM_DELAY / 1000} 秒后自动跳过。`,
+                'forum-skip'
+            );
         }
 
         function getForumCompletionRequirement() {
