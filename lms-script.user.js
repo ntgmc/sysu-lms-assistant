@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         中山大学 LMS 助手
 // @namespace    https://github.com/ntgmc/sysu-lms-assistant
-// @version      2.1.1
+// @version      2.2.0
 // @description  集成自动播放、自动下一页、进度修复、讨论页跳过、讨论任务自动完成与可选计时加速，并提供统一控制面板。
 // @author       ntgmc
 // @match        *://lms.sysu.edu.cn/*
@@ -12,295 +12,505 @@
 // @license      GPL-3.0 License
 // ==/UserScript==
 
-(function() {
-    'use strict';
+(() => {
+  // src/config.js
+  var VERSION = "2.2.0";
+  var INSTANCE_KEY = "__SYSU_LMS_ASSISTANT_V2__";
+  var STORAGE_KEY = "sysu_lms_assistant_settings_v2";
+  var LEGACY_RUNNING_KEY = "lms_script_running";
+  var RESOURCE_PATH = "/mod/fsresource/view.php";
+  var CHECK_INTERVAL = 1e3;
+  var DELAY_BEFORE_NEXT = 1e3;
+  var SKIP_FORUM_DELAY = 2e3;
+  var FORUM_TASK_STORAGE_KEY = "sysu_lms_forum_task_v1";
+  var FORUM_FORM_TIMEOUT = 1e4;
+  var FORUM_VERIFICATION_DELAY = 3e3;
+  var FORUM_TASK_MAX_AGE = 10 * 60 * 1e3;
+  var MIN_TIMER_DELAY = 10;
+  var SPEED_FACTORS = Object.freeze([2, 5, 10, 25, 50]);
+  var DEFAULT_SETTINGS = Object.freeze({
+    assistantEnabled: true,
+    autoPlay: true,
+    autoNext: true,
+    autoQuality: true,
+    skipForum: true,
+    autoCompleteForum: false,
+    forumReplyTemplates: "同意|赞同|支持",
+    timerAcceleration: false,
+    speedFactor: 10,
+    panelExpanded: false
+  });
+  var BOOLEAN_SETTING_KEYS = Object.freeze([
+    "assistantEnabled",
+    "autoPlay",
+    "autoNext",
+    "autoQuality",
+    "skipForum",
+    "autoCompleteForum",
+    "timerAcceleration",
+    "panelExpanded"
+  ]);
 
-    const VERSION = '2.1.1';
-    const INSTANCE_KEY = '__SYSU_LMS_ASSISTANT_V2__';
-    const STORAGE_KEY = 'sysu_lms_assistant_settings_v2';
-    const LEGACY_RUNNING_KEY = 'lms_script_running';
-    const RESOURCE_PATH = '/mod/fsresource/view.php';
-    const CHECK_INTERVAL = 1000;
-    const DELAY_BEFORE_NEXT = 1000;
-    const SKIP_FORUM_DELAY = 2000;
-    const FORUM_TASK_STORAGE_KEY = 'sysu_lms_forum_task_v1';
-    const FORUM_FORM_TIMEOUT = 10000;
-    const FORUM_VERIFICATION_DELAY = 3000;
-    const FORUM_TASK_MAX_AGE = 10 * 60 * 1000;
-    const MIN_TIMER_DELAY = 10;
-    const SPEED_FACTORS = Object.freeze([2, 5, 10, 25, 50]);
+  // src/forum-task.js
+  var FORUM_TASK_PHASES = Object.freeze({
+    OPENING: "opening",
+    ATTEMPTED: "attempted",
+    FAILED: "failed"
+  });
+  function createForumTaskStore(storage, key) {
+    function read() {
+      try {
+        const serialized = storage.getItem(key);
+        if (serialized === null) return null;
+        const parsed = JSON.parse(serialized);
+        return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+      } catch {
+        return null;
+      }
+    }
+    function write(task) {
+      try {
+        storage.setItem(key, JSON.stringify(task));
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    function clear() {
+      try {
+        storage.removeItem(key);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    return { read, write, clear };
+  }
+  function isValidForumTask(task) {
+    return Boolean(task) && typeof task.activityId === "string" && typeof task.sourceUrl === "string" && /^\d+$/.test(String(task.replyPostId || "")) && typeof task.replyText === "string" && task.replyText.trim().length > 0 && Object.values(FORUM_TASK_PHASES).includes(task.phase) && typeof task.verifyReloaded === "boolean" && Number.isFinite(task.startedAt) && (task.discussionId === null || task.discussionId === void 0 || /^\d+$/.test(String(task.discussionId)));
+  }
+  function isForumTaskExpired(task, now, maxAge) {
+    return now - task.startedAt > maxAge;
+  }
 
-    if (window[INSTANCE_KEY]) return;
-
-    const nativeTimers = Object.freeze({
-        setTimeout: window.setTimeout.bind(window),
-        setInterval: window.setInterval.bind(window),
-        clearTimeout: window.clearTimeout.bind(window),
-        clearInterval: window.clearInterval.bind(window)
+  // src/forum-dom.js
+  function getForumCompletionRequirement(document2) {
+    const candidates = Array.from(document2.querySelectorAll(
+      '[data-region="completionrequirements"] [role="listitem"], .automatic-completion-conditions .badge'
+    ));
+    const element = candidates.find((candidate) => candidate.textContent.includes("发表论坛帖子"));
+    if (!element) return { recognized: false, completed: false, element: null };
+    const strongText = element.querySelector("strong")?.textContent.trim() || "";
+    const checkedIcon = Boolean(element.querySelector('img[src*="/i/checked"]'));
+    return {
+      recognized: true,
+      completed: element.classList.contains("alert-success") || strongText === "完成" || checkedIcon,
+      element
+    };
+  }
+  function getForumActivityId(location) {
+    const url = new URL(location.href);
+    const activityId = url.searchParams.get("id");
+    if (/^\d+$/.test(activityId || "")) return activityId;
+    const discussionId = url.searchParams.get("d");
+    return /^\d+$/.test(discussionId || "") ? `d:${discussionId}` : null;
+  }
+  function getForumDiscussionId(document2, location) {
+    const currentUrl = new URL(location.href);
+    const currentDiscussionId = currentUrl.searchParams.get("d");
+    if (/^\d+$/.test(currentDiscussionId || "")) return currentDiscussionId;
+    const links = document2.querySelectorAll('a[href*="/mod/forum/discuss.php?d="]');
+    for (const link of links) {
+      try {
+        const url = new URL(link.href, currentUrl.href);
+        const discussionId = url.searchParams.get("d");
+        if (url.origin === currentUrl.origin && url.pathname === "/mod/forum/discuss.php" && /^\d+$/.test(discussionId || "")) {
+          return discussionId;
+        }
+      } catch {
+      }
+    }
+    return null;
+  }
+  function getNormalizedPageUrl(location) {
+    const url = new URL(location.href);
+    return `${url.origin}${url.pathname}${url.search}`;
+  }
+  function getReplyTargets(document2, location) {
+    const links = Array.from(document2.querySelectorAll(
+      'a[data-action="collapsible-link"][href*="/mod/forum/post.php?reply="]'
+    ));
+    const targets = links.flatMap((element) => {
+      try {
+        const url = new URL(element.href, location.href);
+        const replyPostId = url.searchParams.get("reply");
+        if (url.origin !== location.origin || url.pathname !== "/mod/forum/post.php" || !/^\d+$/.test(replyPostId || "")) {
+          return [];
+        }
+        return [{ element, url, replyPostId }];
+      } catch {
+        return [];
+      }
     });
+    const ordinary = targets.filter(({ element }) => !element.closest(".firstpost.starter"));
+    return ordinary.length > 0 ? ordinary : targets;
+  }
+  function findForumTextarea(form) {
+    const selectors = [
+      'textarea[name="message[text]"]',
+      'textarea[name="message"]',
+      'textarea[name="post"]',
+      'textarea[data-region="post-content"]',
+      'textarea[id^="id_message"]'
+    ];
+    return selectors.map((selector) => form.querySelector(selector)).find(Boolean) || null;
+  }
+  function findForumSubmitButton(form) {
+    const preferred = form.querySelector(
+      '[data-action="forum-submit-post"], #id_submitbutton, [name="submitbutton"]'
+    );
+    if (preferred) return preferred;
+    return Array.from(form.querySelectorAll('button[type="submit"], input[type="submit"]')).find((element) => {
+      const label = `${element.name || ""} ${element.value || ""} ${element.textContent || ""}`;
+      return !/(cancel|取消|advanced|高级)/i.test(label);
+    }) || null;
+  }
+  function fillForumReply(textarea, contentEditable, replyText) {
+    for (const editor of [textarea, contentEditable].filter(Boolean)) {
+      if (editor === textarea) editor.value = replyText;
+      else editor.textContent = replyText;
+      editor.dispatchEvent(new Event("input", { bubbles: true }));
+      editor.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+  }
 
+  // src/navigation.js
+  function getNavigationCancellation(key, settings) {
+    if (key === "assistantEnabled" && !settings.assistantEnabled) return "all";
+    if (key === "autoNext" && !settings.autoNext) return "auto-next";
+    if (key === "skipForum" && !settings.skipForum || key === "autoCompleteForum" && settings.autoCompleteForum) {
+      return "forum-skip";
+    }
+    return null;
+  }
+  function createNavigationScheduler(nativeTimers, location) {
+    let generation = 0;
+    let timeoutId = null;
+    let fallbackId = null;
+    let pending = null;
+    function clearTimers() {
+      if (timeoutId !== null) nativeTimers.clearTimeout(timeoutId);
+      if (fallbackId !== null) nativeTimers.clearTimeout(fallbackId);
+      timeoutId = null;
+      fallbackId = null;
+    }
+    function cancel(kind = null) {
+      if (!pending || kind && pending.kind !== kind) return null;
+      const cancelled = pending;
+      generation += 1;
+      clearTimers();
+      pending = null;
+      return cancelled;
+    }
+    function schedule({ kind, link, delay, isCurrent, onNavigate }) {
+      if (pending) return false;
+      const scheduledGeneration = ++generation;
+      pending = { kind, link };
+      timeoutId = nativeTimers.setTimeout(() => {
+        timeoutId = null;
+        if (scheduledGeneration !== generation || !pending || !isCurrent()) {
+          cancel();
+          return;
+        }
+        onNavigate();
+        link.click();
+        fallbackId = nativeTimers.setTimeout(() => {
+          fallbackId = null;
+          if (scheduledGeneration === generation && link.href) {
+            location.href = link.href;
+          }
+        }, 1e3);
+      }, delay);
+      return true;
+    }
+    return {
+      schedule,
+      cancel,
+      getPending: () => pending
+    };
+  }
+
+  // src/page.js
+  var PAGE_TYPES = Object.freeze({
+    FORUM_POST: "forum-post",
+    FORUM_DISCUSSION: "forum-discussion",
+    VIDEO: "video",
+    RESOURCE: "resource",
+    COURSE: "course"
+  });
+  function classifyPage(document2, location, resourcePath) {
+    const reply = new URL(location.href).searchParams.get("reply") || "";
+    if (location.pathname === "/mod/forum/post.php" && /^\d+$/.test(reply)) {
+      return PAGE_TYPES.FORUM_POST;
+    }
+    if (location.pathname === "/mod/forum/view.php" || location.pathname === "/mod/forum/discuss.php" || document2.body?.id === "page-mod-forum-view" || document2.body?.id === "page-mod-forum-discuss") {
+      return PAGE_TYPES.FORUM_DISCUSSION;
+    }
+    if (document2.querySelector("video")) return PAGE_TYPES.VIDEO;
+    if (location.pathname === resourcePath) return PAGE_TYPES.RESOURCE;
+    return PAGE_TYPES.COURSE;
+  }
+  function getPageKey(location) {
+    return `${location.pathname}${location.search}`;
+  }
+
+  // src/settings.js
+  function createSettingsStore(storage) {
+    let loadIssue = false;
+    function read(key) {
+      try {
+        return storage.getItem(key);
+      } catch {
+        loadIssue = true;
+        return null;
+      }
+    }
+    function write(key, value) {
+      try {
+        storage.setItem(key, value);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    function load() {
+      const settings = { ...DEFAULT_SETTINGS };
+      const serialized = read(STORAGE_KEY);
+      if (serialized === null) {
+        const legacyRunning = read(LEGACY_RUNNING_KEY);
+        if (legacyRunning !== null) settings.assistantEnabled = legacyRunning !== "false";
+        return settings;
+      }
+      try {
+        const parsed = JSON.parse(serialized);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new TypeError("Settings must be an object.");
+        }
+        for (const key of BOOLEAN_SETTING_KEYS) {
+          if (typeof parsed[key] === "boolean") settings[key] = parsed[key];
+        }
+        if (SPEED_FACTORS.includes(parsed.speedFactor)) {
+          settings.speedFactor = parsed.speedFactor;
+        }
+        if (typeof parsed.forumReplyTemplates === "string" && parsed.forumReplyTemplates.length <= 1e3) {
+          settings.forumReplyTemplates = parsed.forumReplyTemplates;
+        }
+      } catch {
+        loadIssue = true;
+      }
+      return settings;
+    }
+    function save(settings, syncLegacy = false) {
+      const saved = write(STORAGE_KEY, JSON.stringify(settings));
+      const legacySaved = !syncLegacy || write(LEGACY_RUNNING_KEY, String(settings.assistantEnabled));
+      return saved && legacySaved;
+    }
+    return {
+      load,
+      save,
+      hasLoadIssue: () => loadIssue
+    };
+  }
+  function parseForumReplyTemplates(value) {
+    if (typeof value !== "string") return [];
+    return value.split("|").map((item) => item.trim()).filter(Boolean);
+  }
+  function chooseRandomItem(items, random = Math.random) {
+    if (!Array.isArray(items) || items.length === 0) return null;
+    return items[Math.floor(random() * items.length)];
+  }
+
+  // src/timers.js
+  function captureNativeTimers(targetWindow) {
+    return Object.freeze({
+      setTimeout: targetWindow.setTimeout.bind(targetWindow),
+      setInterval: targetWindow.setInterval.bind(targetWindow),
+      clearTimeout: targetWindow.clearTimeout.bind(targetWindow),
+      clearInterval: targetWindow.clearInterval.bind(targetWindow)
+    });
+  }
+  function createTimerProxy(original, name, getSpeedFactor, minimumDelay) {
+    const proxy = function(handler, delay, ...args) {
+      const adjustedDelay = typeof delay === "number" && delay > 0 ? Math.max(delay / getSpeedFactor(), minimumDelay) : delay;
+      return original(handler, adjustedDelay, ...args);
+    };
+    proxy.toString = () => original.toString();
+    Object.defineProperty(proxy, "name", { configurable: true, value: name });
+    return proxy;
+  }
+  function installTimerAcceleration({
+    targetWindow,
+    nativeTimers,
+    resourcePath,
+    enabled,
+    getSpeedFactor,
+    minimumDelay
+  }) {
+    if (targetWindow.location.pathname !== resourcePath || !enabled) return false;
+    targetWindow.setTimeout = createTimerProxy(
+      nativeTimers.setTimeout,
+      "setTimeout",
+      getSpeedFactor,
+      minimumDelay
+    );
+    targetWindow.setInterval = createTimerProxy(
+      nativeTimers.setInterval,
+      "setInterval",
+      getSpeedFactor,
+      minimumDelay
+    );
+    return true;
+  }
+
+  // src/video.js
+  function getCompletionState(document2, video) {
+    const progressSpan = document2.querySelector(".num-bfjd span");
+    const statusSpan = document2.querySelector(".tips-completion");
+    const hasProgressTracker = Boolean(progressSpan || statusSpan);
+    const parsedProgress = progressSpan ? Number.parseFloat(progressSpan.innerText) : 0;
+    const progress = Number.isFinite(parsedProgress) ? parsedProgress : 0;
+    const completedText = statusSpan ? statusSpan.innerText.trim() === "已完成" : false;
+    const videoEnded = Boolean(video && video.ended);
+    return {
+      progress,
+      hasProgressTracker,
+      videoEnded,
+      completed: hasProgressTracker ? progress >= 100 || completedText : videoEnded
+    };
+  }
+  function findHdOption(qualityContainer) {
+    return Array.from(qualityContainer.querySelectorAll(".vjs-menu-item")).find((element) => element.innerText.includes("超清")) || null;
+  }
+
+  // src/assistant.js
+  (function() {
+    "use strict";
+    if (window[INSTANCE_KEY]) return;
+    const nativeTimers = captureNativeTimers(window);
     const runtime = {
-        version: VERSION,
-        accelerationInstalled: false,
-        uiInitialized: false
+      version: VERSION,
+      accelerationInstalled: false,
+      uiInitialized: false
     };
     window[INSTANCE_KEY] = runtime;
-
-    const DEFAULT_SETTINGS = Object.freeze({
-        assistantEnabled: true,
-        autoPlay: true,
-        autoNext: true,
-        autoQuality: true,
-        skipForum: true,
-        autoCompleteForum: false,
-        forumReplyTemplates: '同意|赞同|支持',
-        timerAcceleration: false,
-        speedFactor: 10,
-        panelExpanded: false
+    const settingsStore = createSettingsStore(window.localStorage);
+    const forumTaskStore = createForumTaskStore(
+      window.sessionStorage,
+      FORUM_TASK_STORAGE_KEY
+    );
+    let settings = settingsStore.load();
+    const settingsSaveIssue = !settingsStore.save(settings, true);
+    runtime.accelerationInstalled = installTimerAcceleration({
+      targetWindow: window,
+      nativeTimers,
+      resourcePath: RESOURCE_PATH,
+      enabled: settings.timerAcceleration,
+      getSpeedFactor: () => settings.speedFactor,
+      minimumDelay: MIN_TIMER_DELAY
     });
-    const BOOLEAN_SETTING_KEYS = Object.freeze([
-        'assistantEnabled',
-        'autoPlay',
-        'autoNext',
-        'autoQuality',
-        'skipForum',
-        'autoCompleteForum',
-        'timerAcceleration',
-        'panelExpanded'
-    ]);
-
-    let settingsLoadIssue = false;
-    let settings = loadSettings();
-    if (!saveSettings(settings, true)) settingsLoadIssue = true;
-
-    installTimerAcceleration();
-
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', initialize, { once: true });
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", initialize, { once: true });
     } else {
-        nativeTimers.setTimeout(initialize, 0);
+      nativeTimers.setTimeout(initialize, 0);
     }
-
-    function readStorage(key) {
-        try {
-            return window.localStorage.getItem(key);
-        } catch (error) {
-            settingsLoadIssue = true;
-            return null;
-        }
-    }
-
-    function writeStorage(key, value) {
-        try {
-            window.localStorage.setItem(key, value);
-            return true;
-        } catch (error) {
-            return false;
-        }
-    }
-
-    function loadSettings() {
-        const nextSettings = { ...DEFAULT_SETTINGS };
-        const serialized = readStorage(STORAGE_KEY);
-
-        if (serialized !== null) {
-            try {
-                const parsed = JSON.parse(serialized);
-                if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-                    throw new TypeError('Settings must be an object.');
-                }
-
-                BOOLEAN_SETTING_KEYS.forEach((key) => {
-                    if (typeof parsed[key] === 'boolean') {
-                        nextSettings[key] = parsed[key];
-                    }
-                });
-
-                if (SPEED_FACTORS.includes(parsed.speedFactor)) {
-                    nextSettings.speedFactor = parsed.speedFactor;
-                }
-
-                if (typeof parsed.forumReplyTemplates === 'string'
-                    && parsed.forumReplyTemplates.length <= 1000) {
-                    nextSettings.forumReplyTemplates = parsed.forumReplyTemplates;
-                }
-            } catch (error) {
-                settingsLoadIssue = true;
-            }
-        } else {
-            const legacyRunning = readStorage(LEGACY_RUNNING_KEY);
-            if (legacyRunning !== null) {
-                nextSettings.assistantEnabled = legacyRunning !== 'false';
-            }
-        }
-
-        return nextSettings;
-    }
-
-    function saveSettings(nextSettings, syncLegacy = false) {
-        const saved = writeStorage(STORAGE_KEY, JSON.stringify(nextSettings));
-        const legacySaved = !syncLegacy || writeStorage(
-            LEGACY_RUNNING_KEY,
-            String(nextSettings.assistantEnabled)
-        );
-        return saved && legacySaved;
-    }
-
-    function parseForumReplyTemplates(value) {
-        if (typeof value !== 'string') return [];
-        return value.split('|').map((item) => item.trim()).filter(Boolean);
-    }
-
-    function chooseRandomItem(items) {
-        if (!Array.isArray(items) || items.length === 0) return null;
-        return items[Math.floor(Math.random() * items.length)];
-    }
-
     function readForumTask() {
-        try {
-            const serialized = window.sessionStorage.getItem(FORUM_TASK_STORAGE_KEY);
-            if (serialized === null) return null;
-            const parsed = JSON.parse(serialized);
-            return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
-        } catch (error) {
-            return null;
-        }
+      return forumTaskStore.read();
     }
-
     function writeForumTask(task) {
-        try {
-            window.sessionStorage.setItem(FORUM_TASK_STORAGE_KEY, JSON.stringify(task));
-            return true;
-        } catch (error) {
-            return false;
-        }
+      return forumTaskStore.write(task);
     }
-
     function clearForumTask() {
-        try {
-            window.sessionStorage.removeItem(FORUM_TASK_STORAGE_KEY);
-            return true;
-        } catch (error) {
-            return false;
-        }
+      return forumTaskStore.clear();
     }
-
-    function installTimerAcceleration() {
-        if (window.location.pathname !== RESOURCE_PATH || !settings.timerAcceleration) return;
-
-        const createTimerProxy = (original, name) => {
-            const proxy = function(handler, delay, ...args) {
-                const adjustedDelay = typeof delay === 'number' && delay > 0
-                    ? Math.max(delay / settings.speedFactor, MIN_TIMER_DELAY)
-                    : delay;
-                return original(handler, adjustedDelay, ...args);
-            };
-
-            proxy.toString = () => original.toString();
-            Object.defineProperty(proxy, 'name', {
-                configurable: true,
-                value: name
-            });
-            return proxy;
-        };
-
-        window.setTimeout = createTimerProxy(nativeTimers.setTimeout, 'setTimeout');
-        window.setInterval = createTimerProxy(nativeTimers.setInterval, 'setInterval');
-        runtime.accelerationInstalled = true;
-    }
-
     function initialize() {
-        if (runtime.uiInitialized || !document.body) return;
-        runtime.uiInitialized = true;
-
-        let controller;
-        const ui = createUI({
-            getSettings: () => settings,
-            onSettingChange: (key, value) => {
-                if (key === 'forumReplyTemplates'
-                    && (typeof value !== 'string' || value.length > 1000)) {
-                    ui.renderSettings();
-                    ui.showToast(
-                        'forum-template-too-long',
-                        '讨论回复模板不能超过 1000 个字符。',
-                        { tone: 'warning', duration: 5000 }
-                    );
-                    return false;
-                }
-
-                const previousSettings = settings;
-                settings = { ...settings, [key]: value };
-                const saved = saveSettings(settings, key === 'assistantEnabled');
-
-                if (!saved) {
-                    settings = previousSettings;
-                    ui.renderSettings();
-                    ui.showToast(
-                        'settings-save-error',
-                        '设置保存失败，请检查浏览器的站点存储权限。',
-                        { tone: 'error', duration: 5000 }
-                    );
-                    return false;
-                }
-
-                if (controller) controller.handleSettingChange(key);
-                return true;
-            },
-            onAccelerationApply: (pendingAcceleration) => {
-                const enabling = pendingAcceleration.timerAcceleration;
-                const action = enabling ? '启用或调整计时加速' : '关闭计时加速';
-                const warning = `${action}后需要刷新当前页面才能可靠生效。计时加速可能造成学习数据异常，并带来进度清零或账号风险。是否保存设置并立即刷新？`;
-
-                if (!window.confirm(warning)) return false;
-
-                const nextSettings = {
-                    ...settings,
-                    timerAcceleration: pendingAcceleration.timerAcceleration,
-                    speedFactor: pendingAcceleration.speedFactor
-                };
-
-                if (!saveSettings(nextSettings)) {
-                    ui.showToast(
-                        'acceleration-save-error',
-                        '加速设置保存失败，页面不会刷新。',
-                        { tone: 'error', duration: 5000 }
-                    );
-                    return false;
-                }
-
-                settings = nextSettings;
-                window.location.reload();
-                return true;
-            },
-            onForumRetry: () => controller && controller.retryForumTask()
-        });
-
-        controller = createLmsController(ui);
-        controller.start();
-
-        if (settingsLoadIssue) {
+      if (runtime.uiInitialized || !document.body) return;
+      runtime.uiInitialized = true;
+      let controller;
+      const ui = createUI({
+        getSettings: () => settings,
+        onSettingChange: (key, value) => {
+          if (key === "forumReplyTemplates" && (typeof value !== "string" || value.length > 1e3)) {
+            ui.renderSettings();
             ui.showToast(
-                'settings-recovered',
-                '部分设置无法读取，已使用安全默认值。',
-                { tone: 'warning', duration: 5000 }
+              "forum-template-too-long",
+              "讨论回复模板不能超过 1000 个字符。",
+              { tone: "warning", duration: 5e3 }
             );
-        } else if (settings.assistantEnabled) {
-            ui.showToast('assistant-started', `LMS 助手 ${VERSION} 已启动。`);
-        }
+            return false;
+          }
+          const previousSettings = settings;
+          settings = { ...settings, [key]: value };
+          const saved = settingsStore.save(settings, key === "assistantEnabled");
+          if (!saved) {
+            settings = previousSettings;
+            ui.renderSettings();
+            ui.showToast(
+              "settings-save-error",
+              "设置保存失败，请检查浏览器的站点存储权限。",
+              { tone: "error", duration: 5e3 }
+            );
+            return false;
+          }
+          if (controller) controller.handleSettingChange(key);
+          return true;
+        },
+        onAccelerationApply: (pendingAcceleration) => {
+          const enabling = pendingAcceleration.timerAcceleration;
+          const action = enabling ? "启用或调整计时加速" : "关闭计时加速";
+          const warning = `${action}后需要刷新当前页面才能可靠生效。计时加速可能造成学习数据异常，并带来进度清零或账号风险。是否保存设置并立即刷新？`;
+          if (!window.confirm(warning)) return false;
+          const nextSettings = {
+            ...settings,
+            timerAcceleration: pendingAcceleration.timerAcceleration,
+            speedFactor: pendingAcceleration.speedFactor
+          };
+          if (!settingsStore.save(nextSettings)) {
+            ui.showToast(
+              "acceleration-save-error",
+              "加速设置保存失败，页面不会刷新。",
+              { tone: "error", duration: 5e3 }
+            );
+            return false;
+          }
+          settings = nextSettings;
+          window.location.reload();
+          return true;
+        },
+        onForumRetry: () => controller && controller.retryForumTask()
+      });
+      controller = createLmsController(ui);
+      controller.start();
+      if (settingsStore.hasLoadIssue() || settingsSaveIssue) {
+        ui.showToast(
+          "settings-recovered",
+          "部分设置无法读取，已使用安全默认值。",
+          { tone: "warning", duration: 5e3 }
+        );
+      } else if (settings.assistantEnabled) {
+        ui.showToast("assistant-started", `LMS 助手 ${VERSION} 已启动。`);
+      }
     }
-
     function createUI({ getSettings, onSettingChange, onAccelerationApply, onForumRetry }) {
-        const host = document.createElement('div');
-        host.id = 'sysu-lms-assistant-root';
-        host.style.cssText = [
-            'position: fixed',
-            'inset: 0',
-            'z-index: 2147483000',
-            'pointer-events: none'
-        ].join(';');
-
-        const shadow = host.attachShadow({ mode: 'open' });
-        shadow.innerHTML = `
+      const host = document.createElement("div");
+      host.id = "sysu-lms-assistant-root";
+      host.style.cssText = [
+        "position: fixed",
+        "inset: 0",
+        "z-index: 2147483000",
+        "pointer-events: none"
+      ].join(";");
+      const shadow = host.attachShadow({ mode: "open" });
+      shadow.innerHTML = `
             <style>
                 :host {
                     --sla-primary: #0f766e;
@@ -1012,1154 +1222,947 @@
                 </button>
             </div>
         `;
-
-        document.body.appendChild(host);
-
-        const refs = {
-            shell: shadow.getElementById('assistant-shell'),
-            panel: shadow.getElementById('assistant-panel'),
-            trigger: shadow.getElementById('panel-trigger'),
-            triggerText: shadow.getElementById('trigger-text'),
-            close: shadow.getElementById('close-panel'),
-            statusCard: shadow.getElementById('status-card'),
-            statusLabel: shadow.getElementById('status-label'),
-            statusAction: shadow.getElementById('status-action'),
-            pageType: shadow.getElementById('page-type'),
-            toastContainer: shadow.getElementById('toast-container'),
-            forumTemplateCount: shadow.getElementById('forum-template-count'),
-            forumTemplateError: shadow.getElementById('forum-template-error'),
-            retryForumTask: shadow.getElementById('retry-forum-task'),
-            accelerationHelp: shadow.getElementById('acceleration-state-help'),
-            accelerationNote: shadow.getElementById('acceleration-page-note'),
-            applyAcceleration: shadow.getElementById('apply-acceleration'),
-            inputs: {
-                assistantEnabled: shadow.getElementById('assistant-enabled'),
-                autoPlay: shadow.getElementById('auto-play'),
-                autoNext: shadow.getElementById('auto-next'),
-                autoQuality: shadow.getElementById('auto-quality'),
-                skipForum: shadow.getElementById('skip-forum'),
-                autoCompleteForum: shadow.getElementById('auto-complete-forum'),
-                forumReplyTemplates: shadow.getElementById('forum-reply-templates'),
-                timerAcceleration: shadow.getElementById('timer-acceleration'),
-                speedFactor: shadow.getElementById('speed-factor')
-            }
-        };
-
-        const activeToasts = new Map();
-        let pendingAcceleration = {
+      document.body.appendChild(host);
+      const refs = {
+        shell: shadow.getElementById("assistant-shell"),
+        panel: shadow.getElementById("assistant-panel"),
+        trigger: shadow.getElementById("panel-trigger"),
+        triggerText: shadow.getElementById("trigger-text"),
+        close: shadow.getElementById("close-panel"),
+        statusCard: shadow.getElementById("status-card"),
+        statusLabel: shadow.getElementById("status-label"),
+        statusAction: shadow.getElementById("status-action"),
+        pageType: shadow.getElementById("page-type"),
+        toastContainer: shadow.getElementById("toast-container"),
+        forumTemplateCount: shadow.getElementById("forum-template-count"),
+        forumTemplateError: shadow.getElementById("forum-template-error"),
+        retryForumTask: shadow.getElementById("retry-forum-task"),
+        accelerationHelp: shadow.getElementById("acceleration-state-help"),
+        accelerationNote: shadow.getElementById("acceleration-page-note"),
+        applyAcceleration: shadow.getElementById("apply-acceleration"),
+        inputs: {
+          assistantEnabled: shadow.getElementById("assistant-enabled"),
+          autoPlay: shadow.getElementById("auto-play"),
+          autoNext: shadow.getElementById("auto-next"),
+          autoQuality: shadow.getElementById("auto-quality"),
+          skipForum: shadow.getElementById("skip-forum"),
+          autoCompleteForum: shadow.getElementById("auto-complete-forum"),
+          forumReplyTemplates: shadow.getElementById("forum-reply-templates"),
+          timerAcceleration: shadow.getElementById("timer-acceleration"),
+          speedFactor: shadow.getElementById("speed-factor")
+        }
+      };
+      const activeToasts = /* @__PURE__ */ new Map();
+      let pendingAcceleration = {
+        timerAcceleration: getSettings().timerAcceleration,
+        speedFactor: getSettings().speedFactor
+      };
+      const isResourcePage = () => window.location.pathname === RESOURCE_PATH;
+      const setExpanded = (expanded, returnFocus = false) => {
+        refs.shell.dataset.expanded = String(expanded);
+        refs.panel.setAttribute("aria-hidden", String(!expanded));
+        refs.trigger.setAttribute("aria-expanded", String(expanded));
+        const currentSettings = getSettings();
+        if (currentSettings.panelExpanded !== expanded) {
+          onSettingChange("panelExpanded", expanded);
+        }
+        if (returnFocus) refs.trigger.focus();
+      };
+      refs.trigger.addEventListener("click", () => {
+        setExpanded(refs.shell.dataset.expanded !== "true");
+      });
+      refs.close.addEventListener("click", () => setExpanded(false, true));
+      shadow.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && refs.shell.dataset.expanded === "true") {
+          event.preventDefault();
+          setExpanded(false, true);
+        }
+      });
+      Object.entries(refs.inputs).forEach(([key, input]) => {
+        if (key === "timerAcceleration" || key === "speedFactor" || key === "forumReplyTemplates") return;
+        input.addEventListener("change", () => {
+          const value = input.type === "checkbox" ? input.checked : input.value;
+          if (!onSettingChange(key, value)) return;
+          if (key === "assistantEnabled") {
+            showToast(
+              "assistant-toggle",
+              value ? "LMS 助手已恢复运行。" : "LMS 助手已暂停。",
+              { tone: value ? "success" : "warning" }
+            );
+          }
+          renderSettings(false);
+        });
+      });
+      refs.inputs.forumReplyTemplates.addEventListener("input", () => {
+        renderForumTemplateState(refs.inputs.forumReplyTemplates.value);
+      });
+      refs.inputs.forumReplyTemplates.addEventListener("change", () => {
+        const value = refs.inputs.forumReplyTemplates.value;
+        if (!onSettingChange("forumReplyTemplates", value)) return;
+        renderForumTemplateState(value);
+      });
+      refs.retryForumTask.addEventListener("click", () => {
+        const currentTemplateValue = refs.inputs.forumReplyTemplates.value;
+        if (currentTemplateValue !== getSettings().forumReplyTemplates && !onSettingChange("forumReplyTemplates", currentTemplateValue)) {
+          return;
+        }
+        onForumRetry();
+      });
+      refs.inputs.timerAcceleration.addEventListener("change", () => {
+        pendingAcceleration.timerAcceleration = refs.inputs.timerAcceleration.checked;
+        renderAccelerationState();
+      });
+      refs.inputs.speedFactor.addEventListener("change", () => {
+        pendingAcceleration.speedFactor = Number(refs.inputs.speedFactor.value);
+        renderAccelerationState();
+      });
+      refs.applyAcceleration.addEventListener("click", () => {
+        if (!onAccelerationApply({ ...pendingAcceleration })) {
+          pendingAcceleration = {
             timerAcceleration: getSettings().timerAcceleration,
             speedFactor: getSettings().speedFactor
-        };
-
-        const isResourcePage = () => window.location.pathname === RESOURCE_PATH;
-
-        const setExpanded = (expanded, returnFocus = false) => {
-            refs.shell.dataset.expanded = String(expanded);
-            refs.panel.setAttribute('aria-hidden', String(!expanded));
-            refs.trigger.setAttribute('aria-expanded', String(expanded));
-
-            const currentSettings = getSettings();
-            if (currentSettings.panelExpanded !== expanded) {
-                onSettingChange('panelExpanded', expanded);
-            }
-
-            if (returnFocus) refs.trigger.focus();
-        };
-
-        refs.trigger.addEventListener('click', () => {
-            setExpanded(refs.shell.dataset.expanded !== 'true');
-        });
-        refs.close.addEventListener('click', () => setExpanded(false, true));
-        shadow.addEventListener('keydown', (event) => {
-            if (event.key === 'Escape' && refs.shell.dataset.expanded === 'true') {
-                event.preventDefault();
-                setExpanded(false, true);
-            }
-        });
-
-        Object.entries(refs.inputs).forEach(([key, input]) => {
-            if (key === 'timerAcceleration' || key === 'speedFactor'
-                || key === 'forumReplyTemplates') return;
-            input.addEventListener('change', () => {
-                const value = input.type === 'checkbox' ? input.checked : input.value;
-                if (!onSettingChange(key, value)) return;
-
-                if (key === 'assistantEnabled') {
-                    showToast(
-                        'assistant-toggle',
-                        value ? 'LMS 助手已恢复运行。' : 'LMS 助手已暂停。',
-                        { tone: value ? 'success' : 'warning' }
-                    );
-                }
-                renderSettings(false);
-            });
-        });
-
-        refs.inputs.forumReplyTemplates.addEventListener('input', () => {
-            renderForumTemplateState(refs.inputs.forumReplyTemplates.value);
-        });
-        refs.inputs.forumReplyTemplates.addEventListener('change', () => {
-            const value = refs.inputs.forumReplyTemplates.value;
-            if (!onSettingChange('forumReplyTemplates', value)) return;
-            renderForumTemplateState(value);
-        });
-        refs.retryForumTask.addEventListener('click', () => {
-            const currentTemplateValue = refs.inputs.forumReplyTemplates.value;
-            if (currentTemplateValue !== getSettings().forumReplyTemplates
-                && !onSettingChange('forumReplyTemplates', currentTemplateValue)) {
-                return;
-            }
-            onForumRetry();
-        });
-
-        refs.inputs.timerAcceleration.addEventListener('change', () => {
-            pendingAcceleration.timerAcceleration = refs.inputs.timerAcceleration.checked;
-            renderAccelerationState();
-        });
-        refs.inputs.speedFactor.addEventListener('change', () => {
-            pendingAcceleration.speedFactor = Number(refs.inputs.speedFactor.value);
-            renderAccelerationState();
-        });
-        refs.applyAcceleration.addEventListener('click', () => {
-            if (!onAccelerationApply({ ...pendingAcceleration })) {
-                pendingAcceleration = {
-                    timerAcceleration: getSettings().timerAcceleration,
-                    speedFactor: getSettings().speedFactor
-                };
-                renderAccelerationState();
-            }
-        });
-
-        function renderSettings(resetAcceleration = true) {
-            const currentSettings = getSettings();
-            BOOLEAN_SETTING_KEYS.forEach((key) => {
-                if (refs.inputs[key]) refs.inputs[key].checked = currentSettings[key];
-            });
-
-            if (resetAcceleration) {
-                pendingAcceleration = {
-                    timerAcceleration: currentSettings.timerAcceleration,
-                    speedFactor: currentSettings.speedFactor
-                };
-            }
-            refs.shell.dataset.expanded = String(currentSettings.panelExpanded);
-            refs.panel.setAttribute('aria-hidden', String(!currentSettings.panelExpanded));
-            refs.trigger.setAttribute('aria-expanded', String(currentSettings.panelExpanded));
-            if (shadow.activeElement !== refs.inputs.forumReplyTemplates) {
-                refs.inputs.forumReplyTemplates.value = currentSettings.forumReplyTemplates;
-            }
-            renderForumTemplateState(refs.inputs.forumReplyTemplates.value);
-            renderAccelerationState();
-
-            if (!currentSettings.assistantEnabled) {
-                setStatus('paused', '已暂停', '自动化功能已暂停');
-            }
+          };
+          renderAccelerationState();
         }
-
-        function renderAccelerationState() {
-            const currentSettings = getSettings();
-            const hasChanges = pendingAcceleration.timerAcceleration !== currentSettings.timerAcceleration
-                || pendingAcceleration.speedFactor !== currentSettings.speedFactor;
-
-            refs.inputs.timerAcceleration.checked = pendingAcceleration.timerAcceleration;
-            refs.inputs.speedFactor.value = String(pendingAcceleration.speedFactor);
-            refs.applyAcceleration.disabled = !hasChanges;
-            refs.accelerationHelp.textContent = pendingAcceleration.timerAcceleration
-                ? `刷新后按 ${pendingAcceleration.speedFactor}× 生效`
-                : '默认关闭，修改后需刷新';
-            refs.accelerationNote.textContent = isResourcePage()
-                ? (runtime.accelerationInstalled
-                    ? `当前页面已启用 ${currentSettings.speedFactor}× 加速。`
-                    : '当前为资源停留页；应用设置后会自动刷新。')
-                : '仅在资源停留页生效，其他 LMS 页面不会修改计时器。';
+      });
+      function renderSettings(resetAcceleration = true) {
+        const currentSettings = getSettings();
+        BOOLEAN_SETTING_KEYS.forEach((key) => {
+          if (refs.inputs[key]) refs.inputs[key].checked = currentSettings[key];
+        });
+        if (resetAcceleration) {
+          pendingAcceleration = {
+            timerAcceleration: currentSettings.timerAcceleration,
+            speedFactor: currentSettings.speedFactor
+          };
         }
-
-        function renderForumTemplateState(value) {
-            const candidates = parseForumReplyTemplates(value);
-            const isValid = candidates.length > 0;
-            refs.forumTemplateCount.textContent = `${candidates.length} 条候选`;
-            refs.forumTemplateError.hidden = isValid;
-            refs.inputs.forumReplyTemplates.setAttribute('aria-invalid', String(!isValid));
+        refs.shell.dataset.expanded = String(currentSettings.panelExpanded);
+        refs.panel.setAttribute("aria-hidden", String(!currentSettings.panelExpanded));
+        refs.trigger.setAttribute("aria-expanded", String(currentSettings.panelExpanded));
+        if (shadow.activeElement !== refs.inputs.forumReplyTemplates) {
+          refs.inputs.forumReplyTemplates.value = currentSettings.forumReplyTemplates;
         }
-
-        function setForumRetryVisible(visible) {
-            refs.retryForumTask.hidden = !visible;
+        renderForumTemplateState(refs.inputs.forumReplyTemplates.value);
+        renderAccelerationState();
+        if (!currentSettings.assistantEnabled) {
+          setStatus("paused", "已暂停", "自动化功能已暂停");
         }
-
-        function isForumTemplateEditing() {
-            return shadow.activeElement === refs.inputs.forumReplyTemplates;
-        }
-
-        function setStatus(tone, label, action) {
-            refs.statusCard.dataset.tone = tone;
-            refs.trigger.dataset.tone = tone;
-            refs.statusLabel.textContent = label;
-            refs.statusAction.textContent = action;
-            refs.triggerText.textContent = `LMS 助手：${label}`;
-        }
-
-        function setAction(action) {
-            refs.statusAction.textContent = action;
-        }
-
-        function setPageType(type) {
-            refs.pageType.textContent = `页面：${type}`;
-        }
-
-        function showToast(key, message, { tone = 'info', duration = 3000 } = {}) {
-            const now = Date.now();
-            const existingExpiry = activeToasts.get(key);
-            if (existingExpiry && existingExpiry > now) return;
-
-            activeToasts.set(key, now + duration + 1000);
-            const toast = document.createElement('div');
-            toast.className = 'toast';
-            toast.dataset.tone = tone;
-            toast.textContent = message;
-            refs.toastContainer.appendChild(toast);
-
-            nativeTimers.setTimeout(() => {
-                toast.dataset.visible = 'true';
-            }, 10);
-            nativeTimers.setTimeout(() => {
-                toast.dataset.visible = 'false';
-                nativeTimers.setTimeout(() => {
-                    toast.remove();
-                    activeToasts.delete(key);
-                }, 200);
-            }, duration);
-        }
-
-        renderSettings();
-
-        return {
-            renderSettings,
-            setStatus,
-            setAction,
-            setPageType,
-            setForumRetryVisible,
-            isForumTemplateEditing,
-            showToast
-        };
+      }
+      function renderAccelerationState() {
+        const currentSettings = getSettings();
+        const hasChanges = pendingAcceleration.timerAcceleration !== currentSettings.timerAcceleration || pendingAcceleration.speedFactor !== currentSettings.speedFactor;
+        refs.inputs.timerAcceleration.checked = pendingAcceleration.timerAcceleration;
+        refs.inputs.speedFactor.value = String(pendingAcceleration.speedFactor);
+        refs.applyAcceleration.disabled = !hasChanges;
+        refs.accelerationHelp.textContent = pendingAcceleration.timerAcceleration ? `刷新后按 ${pendingAcceleration.speedFactor}× 生效` : "默认关闭，修改后需刷新";
+        refs.accelerationNote.textContent = isResourcePage() ? runtime.accelerationInstalled ? `当前页面已启用 ${currentSettings.speedFactor}× 加速。` : "当前为资源停留页；应用设置后会自动刷新。" : "仅在资源停留页生效，其他 LMS 页面不会修改计时器。";
+      }
+      function renderForumTemplateState(value) {
+        const candidates = parseForumReplyTemplates(value);
+        const isValid = candidates.length > 0;
+        refs.forumTemplateCount.textContent = `${candidates.length} 条候选`;
+        refs.forumTemplateError.hidden = isValid;
+        refs.inputs.forumReplyTemplates.setAttribute("aria-invalid", String(!isValid));
+      }
+      function setForumRetryVisible(visible) {
+        refs.retryForumTask.hidden = !visible;
+      }
+      function isForumTemplateEditing() {
+        return shadow.activeElement === refs.inputs.forumReplyTemplates;
+      }
+      function setStatus(tone, label, action) {
+        refs.statusCard.dataset.tone = tone;
+        refs.trigger.dataset.tone = tone;
+        refs.statusLabel.textContent = label;
+        refs.statusAction.textContent = action;
+        refs.triggerText.textContent = `LMS 助手：${label}`;
+      }
+      function setAction(action) {
+        refs.statusAction.textContent = action;
+      }
+      function setPageType(type) {
+        refs.pageType.textContent = `页面：${type}`;
+      }
+      function showToast(key, message, { tone = "info", duration = 3e3 } = {}) {
+        const now = Date.now();
+        const existingExpiry = activeToasts.get(key);
+        if (existingExpiry && existingExpiry > now) return;
+        activeToasts.set(key, now + duration + 1e3);
+        const toast = document.createElement("div");
+        toast.className = "toast";
+        toast.dataset.tone = tone;
+        toast.textContent = message;
+        refs.toastContainer.appendChild(toast);
+        nativeTimers.setTimeout(() => {
+          toast.dataset.visible = "true";
+        }, 10);
+        nativeTimers.setTimeout(() => {
+          toast.dataset.visible = "false";
+          nativeTimers.setTimeout(() => {
+            toast.remove();
+            activeToasts.delete(key);
+          }, 200);
+        }, duration);
+      }
+      renderSettings();
+      return {
+        renderSettings,
+        setStatus,
+        setAction,
+        setPageType,
+        setForumRetryVisible,
+        isForumTemplateEditing,
+        showToast
+      };
     }
-
     function createLmsController(ui) {
-        const state = {
-            hasNavigated: false,
-            hasSetQuality: false,
-            currentVideo: null,
-            autoplayBlockedFor: null,
-            replayInProgress: false,
-            intervalId: null,
-            lastErrorAt: 0,
-            videoHandlers: null,
-            forumNoticeShown: false,
-            forumVerificationScheduled: false,
-            forumFormWaitStartedAt: 0,
-            forumSubmitStartedAt: 0,
-            forumAutomationBlocked: false,
-            forumRetryAllowed: false,
-            lastForumFailureCode: null,
-            lastForumFailureMessage: '',
-            retryInteractionCleanup: null
-        };
-
-        function start() {
-            updateBaseStatus();
-            state.intervalId = nativeTimers.setInterval(checkPage, CHECK_INTERVAL);
-            window.addEventListener('pagehide', stop, { once: true });
-            checkPage();
+      const navigation = createNavigationScheduler(nativeTimers, window.location);
+      const state = {
+        hasNavigated: false,
+        qualityAttemptedFor: null,
+        currentVideo: null,
+        autoplayBlockedFor: null,
+        replayInProgress: false,
+        intervalId: null,
+        lastErrorAt: 0,
+        videoHandlers: null,
+        forumNoticeShown: false,
+        forumVerificationTimeoutId: null,
+        forumFormWaitStartedAt: 0,
+        forumSubmitStartedAt: 0,
+        forumAutomationBlocked: false,
+        forumRetryAllowed: false,
+        lastForumFailureCode: null,
+        lastForumFailureMessage: "",
+        retryInteractionCleanup: null,
+        pageKey: getPageKey(window.location)
+      };
+      function start() {
+        updateBaseStatus();
+        state.intervalId = nativeTimers.setInterval(checkPage, CHECK_INTERVAL);
+        window.addEventListener("pagehide", stop, { once: true });
+        checkPage();
+      }
+      function stop() {
+        if (state.intervalId !== null) {
+          nativeTimers.clearInterval(state.intervalId);
+          state.intervalId = null;
         }
-
-        function stop() {
-            if (state.intervalId !== null) {
-                nativeTimers.clearInterval(state.intervalId);
-                state.intervalId = null;
-            }
-            detachVideo();
+        cancelNavigation(null, false);
+        clearForumVerification();
+        detachVideo();
+      }
+      function handleSettingChange(key) {
+        if (key === "autoQuality" && settings.autoQuality) {
+          state.qualityAttemptedFor = null;
         }
-
-        function handleSettingChange(key) {
-            if (key === 'autoQuality' && settings.autoQuality) {
-                state.hasSetQuality = false;
-            }
-
-            if (key === 'autoCompleteForum' && !settings.autoCompleteForum) {
-                clearForumTask();
-                resetForumRuntimeState();
-            }
-
-            if (key === 'assistantEnabled') {
-                updateBaseStatus();
-            } else if (key !== 'panelExpanded') {
-                ui.setAction('设置已保存，将在当前页面即时生效');
-            }
-
-            if (key === 'skipForum' || key === 'autoCompleteForum'
-                || key === 'forumReplyTemplates') {
-                nativeTimers.setTimeout(checkPage, 0);
-            }
+        if (key === "autoCompleteForum" && !settings.autoCompleteForum) {
+          clearForumTask();
+          resetForumRuntimeState();
         }
-
-        function updateBaseStatus() {
-            if (settings.assistantEnabled) {
-                ui.setStatus('active', '运行中', '正在检测当前页面');
-            } else {
-                ui.setStatus('paused', '已暂停', '自动化功能已暂停');
-            }
+        const navigationCancellation = getNavigationCancellation(key, settings);
+        if (navigationCancellation) {
+          cancelNavigation(
+            navigationCancellation === "all" ? null : navigationCancellation,
+            true
+          );
         }
-
-        function checkPage() {
-            try {
-                if (!settings.assistantEnabled) {
-                    ui.setStatus('paused', '已暂停', '自动化功能已暂停');
-                    return;
-                }
-                if (state.hasNavigated) return;
-
-                const nextLink = document.getElementById('next-activity-link');
-                const isForumPostPage = window.location.pathname === '/mod/forum/post.php'
-                    && /^\d+$/.test(new URL(window.location.href).searchParams.get('reply') || '');
-                const isForumPage = window.location.pathname === '/mod/forum/view.php'
-                    || window.location.pathname === '/mod/forum/discuss.php'
-                    || document.body.id === 'page-mod-forum-view'
-                    || document.body.id === 'page-mod-forum-discuss';
-
-                if (isForumPostPage) {
-                    handleForumPostPage();
-                    return;
-                }
-
-                if (isForumPage) {
-                    handleForumDiscussionPage(nextLink);
-                    return;
-                }
-
-                ui.setForumRetryVisible(false);
-
-                const video = document.querySelector('video');
-                attachVideo(video);
-                ui.setPageType(video ? '视频课程' : (window.location.pathname === RESOURCE_PATH ? '资源停留页' : '普通课程页'));
-
-                handleQuality();
-
-                if (video && settings.autoPlay && video.paused && !video.ended
-                    && state.autoplayBlockedFor !== video) {
-                    attemptPlay(video, false);
-                }
-
-                handleCompletion(video, nextLink);
-
-                if (!video && !document.querySelector('.num-bfjd span, .tips-completion')) {
-                    ui.setStatus('active', '等待页面内容', '尚未检测到视频或进度信息');
-                } else if (video && !video.paused && !video.ended) {
-                    ui.setStatus('active', '正在播放', '正在监测学习进度');
-                }
-            } catch (error) {
-                const now = Date.now();
-                ui.setStatus('error', '发生错误', '页面结构暂时无法识别，将继续重试');
-                if (now - state.lastErrorAt > 10000) {
-                    state.lastErrorAt = now;
-                    ui.showToast(
-                        'page-check-error',
-                        '页面检测出现异常，助手将在后台继续重试。',
-                        { tone: 'error', duration: 5000 }
-                    );
-                    console.error('[SYSU LMS Assistant] Page check failed:', error);
-                }
-            }
+        if (key === "assistantEnabled" && !settings.assistantEnabled) {
+          clearForumVerification();
+          detachVideo();
         }
-
-        function handleForumDiscussionPage(nextLink) {
-            ui.setPageType('讨论页');
-
-            if (!settings.autoCompleteForum) {
-                clearForumTask();
-                resetForumRuntimeState();
-                if (settings.skipForum) {
-                    handleForumSkip(nextLink);
-                    return;
-                }
-                ui.setStatus('active', '等待手动操作', '讨论页跳过和任务自动完成均已关闭');
-                return;
-            }
-
-            if (ui.isForumTemplateEditing()) {
-                ui.setStatus('active', '正在编辑设置', '保存回复模板后继续处理讨论任务');
-                return;
-            }
-
-            const requirement = getForumCompletionRequirement();
-            if (requirement.completed) {
-                completeForumTask(nextLink);
-                return;
-            }
-
-            if (state.forumAutomationBlocked) {
-                ui.setStatus('error', '讨论任务失败', state.lastForumFailureMessage);
-                ui.setForumRetryVisible(state.forumRetryAllowed);
-                return;
-            }
-
-            if (!requirement.recognized) {
-                blockForumTask(
-                    'unsupported-requirement',
-                    '未识别到“发表论坛帖子”完成要求，请手动处理。',
-                    { retry: false }
-                );
-                return;
-            }
-
-            const templates = parseForumReplyTemplates(settings.forumReplyTemplates);
-            if (templates.length === 0) {
-                showForumTemplateError();
-                return;
-            }
-
-            let task = readForumTask();
-            if (task && !isValidForumTask(task)) {
-                if (!clearForumTask()) {
-                    blockForumTask(
-                        'invalid-task-clear-failed',
-                        '讨论待办已损坏且无法清除，已停止自动操作。',
-                        { retry: false }
-                    );
-                    return;
-                }
-                task = null;
-            }
-
-            if (task && !isTaskForCurrentDiscussion(task)) {
-                blockForumTask(
-                    'activity-mismatch',
-                    '讨论待办与当前活动不匹配，为防止误发已停止。',
-                    { task }
-                );
-                return;
-            }
-
-            if (task) {
-                if (Date.now() - task.startedAt > FORUM_TASK_MAX_AGE) {
-                    blockForumTask('task-expired', '讨论任务等待已超过 10 分钟，请手动重试。', { task });
-                    return;
-                }
-
-                if (task.phase === 'failed') {
-                    blockForumTask(
-                        task.errorCode || 'previous-failure',
-                        '上次自动回复未能确认完成，请检查页面后重试。',
-                        { task }
-                    );
-                    return;
-                }
-
-                if (task.phase === 'attempted') {
-                    verifyForumCompletion(task, nextLink);
-                    return;
-                }
-
-                blockForumTask(
-                    'reply-navigation-incomplete',
-                    '回复页面未能正常打开，为防止重复发帖已停止。',
-                    { task }
-                );
-                return;
-            }
-
-            startForumReply(templates);
+        if (key === "assistantEnabled") {
+          updateBaseStatus();
+        } else if (key !== "panelExpanded") {
+          ui.setAction("设置已保存，将在当前页面即时生效");
         }
-
-        function handleForumSkip(nextLink) {
-            ui.setForumRetryVisible(false);
-
-            if (!nextLink) {
-                ui.setStatus('warning', '需要手动操作', '讨论页没有可用的下一页链接');
-                if (!state.forumNoticeShown) {
-                    state.forumNoticeShown = true;
-                    ui.showToast(
-                        'forum-no-next',
-                        '检测到讨论页，但没有找到下一页链接。',
-                        { tone: 'warning', duration: 5000 }
-                    );
-                }
-                return;
-            }
-
-            scheduleNavigation(
-                nextLink,
-                SKIP_FORUM_DELAY,
-                `检测到讨论页，${SKIP_FORUM_DELAY / 1000} 秒后自动跳过。`,
-                'forum-skip'
-            );
+        if (key !== "panelExpanded" && settings.assistantEnabled) {
+          nativeTimers.setTimeout(checkPage, 0);
         }
-
-        function getForumCompletionRequirement() {
-            const candidates = Array.from(document.querySelectorAll(
-                '[data-region="completionrequirements"] [role="listitem"], .automatic-completion-conditions .badge'
-            ));
-            const element = candidates.find((candidate) => candidate.textContent.includes('发表论坛帖子'));
-            if (!element) return { recognized: false, completed: false, element: null };
-
-            const strongText = element.querySelector('strong')?.textContent.trim() || '';
-            const hasCheckedIcon = Boolean(element.querySelector('img[src*="/i/checked"]'));
-            const completed = element.classList.contains('alert-success')
-                || strongText === '完成'
-                || hasCheckedIcon;
-            return { recognized: true, completed, element };
+      }
+      function updateBaseStatus() {
+        if (settings.assistantEnabled) {
+          ui.setStatus("active", "运行中", "正在检测当前页面");
+        } else {
+          ui.setStatus("paused", "已暂停", "自动化功能已暂停");
         }
-
-        function getForumActivityId() {
-            const url = new URL(window.location.href);
-            const activityId = url.searchParams.get('id');
-            if (/^\d+$/.test(activityId || '')) return activityId;
-            const discussionId = url.searchParams.get('d');
-            return /^\d+$/.test(discussionId || '') ? `d:${discussionId}` : null;
-        }
-
-        function getForumDiscussionId() {
-            const currentUrl = new URL(window.location.href);
-            const currentDiscussionId = currentUrl.searchParams.get('d');
-            if (/^\d+$/.test(currentDiscussionId || '')) return currentDiscussionId;
-
-            const links = document.querySelectorAll('a[href*="/mod/forum/discuss.php?d="]');
-            for (const link of links) {
-                try {
-                    const url = new URL(link.href, currentUrl.href);
-                    const discussionId = url.searchParams.get('d');
-                    if (url.origin === currentUrl.origin
-                        && url.pathname === '/mod/forum/discuss.php'
-                        && /^\d+$/.test(discussionId || '')) {
-                        return discussionId;
-                    }
-                } catch (error) {
-                    // Ignore malformed host-page links and continue searching.
-                }
-            }
-            return null;
-        }
-
-        function getNormalizedPageUrl() {
-            const url = new URL(window.location.href);
-            return `${url.origin}${url.pathname}${url.search}`;
-        }
-
-        function isValidForumTask(task) {
-            return typeof task.activityId === 'string'
-                && typeof task.sourceUrl === 'string'
-                && /^\d+$/.test(String(task.replyPostId || ''))
-                && typeof task.replyText === 'string'
-                && task.replyText.trim().length > 0
-                && ['opening', 'attempted', 'failed'].includes(task.phase)
-                && typeof task.verifyReloaded === 'boolean'
-                && Number.isFinite(task.startedAt)
-                && (task.discussionId === null
-                    || task.discussionId === undefined
-                    || /^\d+$/.test(String(task.discussionId)));
-        }
-
-        function isTaskForCurrentDiscussion(task) {
-            try {
-                const currentUrl = new URL(window.location.href);
-                const sourceUrl = new URL(task.sourceUrl);
-                if (sourceUrl.origin !== currentUrl.origin) return false;
-
-                if (sourceUrl.pathname === currentUrl.pathname) {
-                    return task.activityId === getForumActivityId();
-                }
-
-                return task.phase === 'attempted'
-                    && currentUrl.pathname === '/mod/forum/discuss.php'
-                    && typeof task.discussionId === 'string'
-                    && task.discussionId === getForumDiscussionId();
-            } catch (error) {
-                return false;
-            }
-        }
-
-        function getReplyTargets() {
-            const links = Array.from(document.querySelectorAll(
-                'a[data-action="collapsible-link"][href*="/mod/forum/post.php?reply="]'
-            ));
-            const targets = links.flatMap((element) => {
-                try {
-                    const url = new URL(element.href, window.location.href);
-                    const replyPostId = url.searchParams.get('reply');
-                    if (url.origin !== window.location.origin
-                        || url.pathname !== '/mod/forum/post.php'
-                        || !/^\d+$/.test(replyPostId || '')) {
-                        return [];
-                    }
-                    return [{ element, url, replyPostId }];
-                } catch (error) {
-                    return [];
-                }
-            });
-            const ordinaryTargets = targets.filter(({ element }) => !element.closest('.firstpost.starter'));
-            return ordinaryTargets.length > 0 ? ordinaryTargets : targets;
-        }
-
-        function startForumReply(templates) {
-            const activityId = getForumActivityId();
-            if (!activityId) {
-                blockForumTask(
-                    'missing-activity-id',
-                    '无法识别当前讨论活动编号，请手动处理。',
-                    { retry: false }
-                );
-                return;
-            }
-
-            const target = chooseRandomItem(getReplyTargets());
-            if (!target) {
-                blockForumTask('missing-reply-link', '当前讨论没有可用的回复入口。');
-                return;
-            }
-
-            const replyText = chooseRandomItem(templates);
-            const task = {
-                activityId,
-                discussionId: getForumDiscussionId(),
-                sourceUrl: getNormalizedPageUrl(),
-                replyPostId: target.replyPostId,
-                replyText,
-                phase: 'opening',
-                verifyReloaded: false,
-                startedAt: Date.now(),
-                errorCode: null
-            };
-
-            if (!writeForumTask(task)) {
-                blockForumTask(
-                    'session-storage-unavailable',
-                    '无法保存防重复状态，已取消自动回复。'
-                );
-                return;
-            }
-
-            ui.setForumRetryVisible(false);
-            ui.setStatus('active', '正在打开回复页', '已选择回复内容，正在进入 Moodle 原生表单');
-            ui.showToast('forum-opening-reply', '正在打开讨论回复页面。');
-            state.hasNavigated = true;
-            window.location.assign(target.url.href);
-        }
-
-        function verifyForumCompletion(task, nextLink) {
-            if (task.verifyReloaded) {
-                blockForumTask(
-                    'completion-unconfirmed',
-                    '平台刷新后仍未确认讨论完成，为防止重复发帖已停止。',
-                    { task }
-                );
-                return;
-            }
-
-            ui.setForumRetryVisible(false);
-            ui.setStatus('active', '等待平台确认', '正在等待“发表论坛帖子”完成状态更新');
-            if (state.forumVerificationScheduled) return;
-            state.forumVerificationScheduled = true;
-
-            nativeTimers.setTimeout(() => {
-                state.forumVerificationScheduled = false;
-                if (!settings.assistantEnabled || !settings.autoCompleteForum) return;
-
-                const latestTask = readForumTask();
-                if (!latestTask || latestTask.phase !== 'attempted') return;
-
-                const latestRequirement = getForumCompletionRequirement();
-                if (latestRequirement.recognized && latestRequirement.completed) {
-                    completeForumTask(nextLink);
-                    return;
-                }
-
-                const updatedTask = { ...latestTask, verifyReloaded: true };
-                if (!writeForumTask(updatedTask)) {
-                    blockForumTask(
-                        'verification-state-save-failed',
-                        '无法保存完成验证状态，已停止自动操作。',
-                        { task: latestTask }
-                    );
-                    return;
-                }
-
-                state.hasNavigated = true;
-                window.location.reload();
-            }, FORUM_VERIFICATION_DELAY);
-        }
-
-        function completeForumTask(nextLink) {
-            clearForumTask();
-            resetForumRuntimeState();
-
-            if (nextLink && settings.autoNext) {
-                scheduleNavigation(
-                    nextLink,
-                    DELAY_BEFORE_NEXT,
-                    `讨论任务已完成，${DELAY_BEFORE_NEXT / 1000} 秒后进入下一页。`,
-                    'forum-complete'
-                );
-            } else if (!nextLink) {
-                ui.setStatus('complete', '已完成', '讨论任务已完成，当前为最后一节');
-                ui.showToast(
-                    'forum-last-activity',
-                    '讨论任务已完成，当前为最后一节。',
-                    { tone: 'success', duration: 5000 }
-                );
-                stop();
-            } else {
-                ui.setStatus('complete', '已完成', '自动下一页已关闭，请手动继续');
-            }
-        }
-
-        function showForumTemplateError() {
-            ui.setForumRetryVisible(false);
-            ui.setStatus('warning', '需要设置回复', '随机回复模板至少需要一条非空内容');
-            if (state.lastForumFailureCode !== 'empty-template') {
-                state.lastForumFailureCode = 'empty-template';
-                ui.showToast(
-                    'forum-empty-template',
-                    '讨论回复模板为空，请在控制面板中填写后重试。',
-                    { tone: 'warning', duration: 5000 }
-                );
-            }
-        }
-
-        function handleForumPostPage() {
-            ui.setPageType('讨论回复页');
-
-            if (!settings.autoCompleteForum) {
-                clearForumTask();
-                resetForumRuntimeState();
-                ui.setStatus('active', '等待手动操作', '讨论任务自动完成已关闭');
-                return;
-            }
-
-            if (state.forumAutomationBlocked) {
-                ui.setStatus('error', '讨论任务失败', state.lastForumFailureMessage);
-                ui.setForumRetryVisible(state.forumRetryAllowed);
-                return;
-            }
-
-            const task = readForumTask();
-            if (!task || !isValidForumTask(task)) {
-                blockForumTask(
-                    'missing-pending-task',
-                    '未找到有效的讨论回复待办，请返回讨论页后重试。'
-                );
-                return;
-            }
-
-            if (Date.now() - task.startedAt > FORUM_TASK_MAX_AGE) {
-                blockForumTask('task-expired', '讨论任务等待已超过 10 分钟，请手动重试。', { task });
-                return;
-            }
-
-            const replyPostId = new URL(window.location.href).searchParams.get('reply');
-            if (replyPostId !== String(task.replyPostId)) {
-                blockForumTask('reply-target-mismatch', '回复目标与待办记录不一致，已停止提交。', { task });
-                return;
-            }
-
-            if (task.phase === 'failed') {
-                blockForumTask(
-                    task.errorCode || 'previous-failure',
-                    '上次自动回复失败，请检查页面后重试。',
-                    { task }
-                );
-                return;
-            }
-
-            if (task.phase === 'attempted') {
-                if (state.forumSubmitStartedAt > 0
-                    && Date.now() - state.forumSubmitStartedAt < FORUM_FORM_TIMEOUT) {
-                    ui.setForumRetryVisible(false);
-                    ui.setStatus('active', '正在提交回复', '等待 Moodle 接收并返回讨论页');
-                } else {
-                    blockForumTask(
-                        'submit-did-not-navigate',
-                        '回复提交后页面未正常返回，为防止重复发帖已停止。',
-                        { task }
-                    );
-                }
-                return;
-            }
-
-            if (state.forumFormWaitStartedAt === 0) {
-                state.forumFormWaitStartedAt = Date.now();
-            }
-
-            const form = document.querySelector('form#mformforum');
-            if (!form) {
-                if (Date.now() - state.forumFormWaitStartedAt < FORUM_FORM_TIMEOUT) {
-                    ui.setForumRetryVisible(false);
-                    ui.setStatus('active', '等待回复表单', '正在等待 Moodle 加载原生回复表单');
-                    return;
-                }
-                blockForumTask('reply-form-missing', '等待 10 秒后仍未找到 Moodle 回复表单。', { task });
-                return;
-            }
-
-            const textarea = findForumTextarea(form);
-            const contentEditable = form.querySelector(
-                '[contenteditable="true"][role="textbox"], [contenteditable="true"]'
-            );
-            if (!textarea && !contentEditable) {
-                if (Date.now() - state.forumFormWaitStartedAt < FORUM_FORM_TIMEOUT) {
-                    ui.setStatus('active', '等待回复编辑器', '正在等待 Moodle 初始化回复编辑器');
-                    return;
-                }
-                blockForumTask('reply-editor-missing', '未找到兼容的 Moodle 回复编辑器。', { task });
-                return;
-            }
-
-            const submitButton = findForumSubmitButton(form);
-            if (!submitButton) {
-                if (Date.now() - state.forumFormWaitStartedAt < FORUM_FORM_TIMEOUT) {
-                    ui.setStatus('active', '等待提交按钮', '正在等待 Moodle 初始化发表按钮');
-                    return;
-                }
-                blockForumTask('reply-submit-missing', '未找到兼容的 Moodle 发表按钮。', { task });
-                return;
-            }
-
-            if (submitButton.disabled || submitButton.getAttribute('aria-disabled') === 'true') {
-                if (Date.now() - state.forumFormWaitStartedAt < FORUM_FORM_TIMEOUT) {
-                    ui.setStatus('active', '等待提交按钮', 'Moodle 仍在初始化发表按钮');
-                    return;
-                }
-                blockForumTask('reply-submit-disabled', 'Moodle 发表按钮持续不可用。', { task });
-                return;
-            }
-
-            fillForumReply(textarea, contentEditable, task.replyText);
-            const attemptedTask = { ...task, phase: 'attempted', errorCode: null };
-            if (!writeForumTask(attemptedTask)) {
-                blockForumTask(
-                    'attempt-state-save-failed',
-                    '无法保存已提交状态，为防止重复发帖已取消提交。',
-                    { task }
-                );
-                return;
-            }
-
-            state.forumSubmitStartedAt = Date.now();
-            ui.setForumRetryVisible(false);
-            ui.setStatus('active', '正在提交回复', '已填充随机回复，正在交由 Moodle 原生表单提交');
-            ui.showToast('forum-submitting', '正在提交讨论回复，请勿关闭页面。');
-
-            try {
-                if (typeof form.requestSubmit === 'function') {
-                    form.requestSubmit(submitButton);
-                } else {
-                    submitButton.click();
-                }
-            } catch (error) {
-                blockForumTask('reply-submit-error', 'Moodle 回复表单提交失败，请手动重试。', {
-                    task: attemptedTask
-                });
-                console.error('[SYSU LMS Assistant] Forum reply submission failed:', error);
-            }
-        }
-
-        function findForumTextarea(form) {
-            const selectors = [
-                'textarea[name="message[text]"]',
-                'textarea[name="message"]',
-                'textarea[name="post"]',
-                'textarea[data-region="post-content"]',
-                'textarea[id^="id_message"]'
-            ];
-            return selectors.map((selector) => form.querySelector(selector)).find(Boolean) || null;
-        }
-
-        function findForumSubmitButton(form) {
-            const preferred = form.querySelector(
-                '[data-action="forum-submit-post"], #id_submitbutton, [name="submitbutton"]'
-            );
-            if (preferred) return preferred;
-
-            return Array.from(form.querySelectorAll('button[type="submit"], input[type="submit"]'))
-                .find((element) => {
-                    const label = `${element.name || ''} ${element.value || ''} ${element.textContent || ''}`;
-                    return !/(cancel|取消|advanced|高级)/i.test(label);
-                }) || null;
-        }
-
-        function fillForumReply(textarea, contentEditable, replyText) {
-            if (textarea) {
-                textarea.value = replyText;
-                textarea.dispatchEvent(new Event('input', { bubbles: true }));
-                textarea.dispatchEvent(new Event('change', { bubbles: true }));
-            }
-            if (contentEditable) {
-                contentEditable.textContent = replyText;
-                contentEditable.dispatchEvent(new Event('input', { bubbles: true }));
-                contentEditable.dispatchEvent(new Event('change', { bubbles: true }));
-            }
-        }
-
-        function blockForumTask(code, message, { task = readForumTask(), retry = true } = {}) {
-            if (task && isValidForumTask(task)) {
-                writeForumTask({ ...task, phase: 'failed', errorCode: code });
-            }
-
-            state.forumAutomationBlocked = true;
-            state.forumRetryAllowed = retry;
-            state.forumVerificationScheduled = false;
-            state.lastForumFailureMessage = message;
-            ui.setForumRetryVisible(retry);
-            ui.setStatus('error', '讨论任务失败', message);
-
-            if (state.lastForumFailureCode !== code) {
-                state.lastForumFailureCode = code;
-                const recoveryMessage = retry ? `${message} 可在控制面板中重试。` : message;
-                ui.showToast(`forum-failure-${code}`, recoveryMessage, {
-                    tone: 'error',
-                    duration: 5000
-                });
-            }
-        }
-
-        function resetForumRuntimeState() {
-            state.forumVerificationScheduled = false;
-            state.forumFormWaitStartedAt = 0;
-            state.forumSubmitStartedAt = 0;
-            state.forumAutomationBlocked = false;
-            state.forumRetryAllowed = false;
-            state.lastForumFailureCode = null;
-            state.lastForumFailureMessage = '';
-            ui.setForumRetryVisible(false);
-        }
-
-        function retryForumTask() {
-            const task = readForumTask();
-            const sourceUrl = task?.sourceUrl || null;
-            if (!clearForumTask()) {
-                blockForumTask(
-                    'retry-state-clear-failed',
-                    '无法清除旧的防重复状态，已取消重试。'
-                );
-                return;
-            }
-
-            resetForumRuntimeState();
-            ui.setStatus('active', '准备重试', '正在重新选择回复目标和内容');
-
-            if (window.location.pathname === '/mod/forum/post.php' && sourceUrl) {
-                try {
-                    const url = new URL(sourceUrl);
-                    if (url.origin !== window.location.origin) throw new TypeError('Cross-origin source URL.');
-                    state.hasNavigated = true;
-                    window.location.assign(url.href);
-                    return;
-                } catch (error) {
-                    blockForumTask('invalid-source-url', '原讨论页地址无效，无法自动返回。');
-                    return;
-                }
-            }
-
-            nativeTimers.setTimeout(checkPage, 0);
-        }
-
-        function handleQuality() {
-            if (!settings.autoQuality || state.hasSetQuality) return;
-
-            const qualityContainer = document.querySelector('.tcp-video-quality-switcher');
-            if (!qualityContainer) return;
-
-            const qualityText = qualityContainer.querySelector('.tcp-quality-switcher-value p');
-            const currentQuality = qualityText ? qualityText.innerText.trim() : '';
-
-            if (currentQuality !== '超清') {
-                const hdOption = Array.from(qualityContainer.querySelectorAll('.vjs-menu-item'))
-                    .find((element) => element.innerText.includes('超清'));
-
-                if (hdOption) {
-                    hdOption.click();
-                    ui.setAction('已自动切换为超清画质');
-                    ui.showToast('quality-hd', '已自动切换为超清画质。', { tone: 'success' });
-                } else {
-                    ui.showToast(
-                        'quality-missing',
-                        '当前视频没有可用的超清选项，将保持默认画质。',
-                        { tone: 'warning' }
-                    );
-                }
-            }
-
-            state.hasSetQuality = true;
-        }
-
-        function handleCompletion(video, nextLink) {
-            const progressSpan = document.querySelector('.num-bfjd span');
-            const statusSpan = document.querySelector('.tips-completion');
-            const hasProgressTracker = Boolean(progressSpan || statusSpan);
-            const parsedProgress = progressSpan ? Number.parseFloat(progressSpan.innerText) : 0;
-            const progress = Number.isFinite(parsedProgress) ? parsedProgress : 0;
-            const isCompletedText = statusSpan ? statusSpan.innerText.trim() === '已完成' : false;
-            const isVideoEnded = Boolean(video && video.ended);
-            const isTrulyCompleted = hasProgressTracker
-                ? progress >= 100 || isCompletedText
-                : isVideoEnded;
-
-            if (isTrulyCompleted) {
-                if (nextLink && settings.autoNext) {
-                    scheduleNavigation(
-                        nextLink,
-                        DELAY_BEFORE_NEXT,
-                        `学习任务已完成，${DELAY_BEFORE_NEXT / 1000} 秒后进入下一页。`,
-                        'activity-complete'
-                    );
-                } else if (!nextLink) {
-                    ui.setStatus('complete', '已完成', '当前为最后一节，自动化已停止');
-                    ui.showToast(
-                        'course-last-activity',
-                        '学习任务已完成，当前为最后一节。',
-                        { tone: 'success', duration: 5000 }
-                    );
-                    stop();
-                } else {
-                    ui.setStatus('complete', '已完成', '自动下一页已关闭，请手动继续');
-                }
-                return;
-            }
-
-            if (isVideoEnded && hasProgressTracker && video && !state.replayInProgress) {
-                if (!settings.autoPlay) {
-                    ui.setStatus('warning', '需要手动操作', `视频已结束但进度为 ${progress}%，自动播放已关闭`);
-                    return;
-                }
-
-                state.replayInProgress = true;
-                video.currentTime = 0;
-                ui.setStatus('warning', '正在修复进度', `视频已结束但进度为 ${progress}%，正在重播`);
-                ui.showToast(
-                    'progress-replay',
-                    `视频已结束但进度为 ${progress}%，正在自动重播补全进度。`,
-                    { tone: 'warning', duration: 5000 }
-                );
-                attemptPlay(video, true);
-            }
-        }
-
-        function scheduleNavigation(nextLink, delay, message, toastKey) {
-            if (state.hasNavigated) return;
-            state.hasNavigated = true;
-            ui.setStatus('active', '等待跳转', message);
-            ui.showToast(toastKey, message, { tone: 'success' });
-
-            nativeTimers.setTimeout(() => {
-                ui.setAction('正在进入下一页');
-                nextLink.click();
-                nativeTimers.setTimeout(() => {
-                    if (nextLink.href) window.location.href = nextLink.href;
-                }, 1000);
-            }, delay);
-        }
-
-        function attachVideo(video) {
-            if (state.currentVideo === video) return;
-            detachVideo();
-            state.currentVideo = video;
-            state.autoplayBlockedFor = null;
-            state.replayInProgress = false;
-
-            if (!video) return;
-
-            const handlePause = () => {
-                if (!settings.assistantEnabled || !settings.autoPlay || video.ended || state.hasNavigated) return;
-                ui.setStatus('warning', '检测到暂停', '正在尝试恢复视频播放');
-                ui.showToast(
-                    'video-paused',
-                    '检测到视频暂停，正在尝试恢复播放。',
-                    { tone: 'warning' }
-                );
-                attemptPlay(video, true);
-            };
-            const handlePlay = () => {
-                state.autoplayBlockedFor = null;
-                state.replayInProgress = false;
-                clearPlaybackRetry();
-                if (settings.assistantEnabled) {
-                    ui.setStatus('active', '正在播放', '正在监测学习进度');
-                }
-            };
-
-            state.videoHandlers = { handlePause, handlePlay };
-            video.addEventListener('pause', handlePause);
-            video.addEventListener('play', handlePlay);
-        }
-
-        function detachVideo() {
-            if (state.currentVideo && state.videoHandlers) {
-                state.currentVideo.removeEventListener('pause', state.videoHandlers.handlePause);
-                state.currentVideo.removeEventListener('play', state.videoHandlers.handlePlay);
-            }
-            state.currentVideo = null;
-            state.videoHandlers = null;
-            clearPlaybackRetry();
-        }
-
-        function attemptPlay(video, isRecovery) {
-            if (!settings.assistantEnabled || !settings.autoPlay || !video) return;
-
-            video.muted = true;
-            let playResult;
-            try {
-                playResult = video.play();
-            } catch (error) {
-                handlePlayFailure(video, error);
-                return;
-            }
-
-            if (playResult && typeof playResult.catch === 'function') {
-                playResult.catch((error) => handlePlayFailure(video, error));
-            } else if (isRecovery) {
-                ui.setAction('已请求恢复视频播放');
-            }
-        }
-
-        function handlePlayFailure(video, error) {
-            if (state.currentVideo !== video || !settings.assistantEnabled || !settings.autoPlay) return;
-            state.autoplayBlockedFor = video;
-            state.replayInProgress = false;
-            ui.setStatus('warning', '需要手动操作', '浏览器阻止了自动播放，请点击页面激活视频');
+      }
+      function checkPage() {
+        try {
+          const currentPageKey = getPageKey(window.location);
+          if (currentPageKey !== state.pageKey) {
+            cancelNavigation(null, false);
+            clearForumVerification();
+            state.hasNavigated = false;
+            state.pageKey = currentPageKey;
+          }
+          if (!settings.assistantEnabled) {
+            ui.setStatus("paused", "已暂停", "自动化功能已暂停");
+            return;
+          }
+          if (state.hasNavigated) return;
+          const nextLink = document.getElementById("next-activity-link");
+          const pageType = classifyPage(document, window.location, RESOURCE_PATH);
+          if (pageType === PAGE_TYPES.FORUM_POST) {
+            handleForumPostPage();
+            return;
+          }
+          if (pageType === PAGE_TYPES.FORUM_DISCUSSION) {
+            handleForumDiscussionPage(nextLink);
+            return;
+          }
+          ui.setForumRetryVisible(false);
+          const video = document.querySelector("video");
+          attachVideo(video);
+          ui.setPageType(pageType === PAGE_TYPES.VIDEO ? "视频课程" : pageType === PAGE_TYPES.RESOURCE ? "资源停留页" : "普通课程页");
+          handleQuality(video);
+          if (video && settings.autoPlay && video.paused && !video.ended && state.autoplayBlockedFor !== video) {
+            attemptPlay(video, false);
+          }
+          handleCompletion(video, nextLink);
+          if (!video && !document.querySelector(".num-bfjd span, .tips-completion")) {
+            ui.setStatus("active", "等待页面内容", "尚未检测到视频或进度信息");
+          } else if (video && !video.paused && !video.ended) {
+            ui.setStatus("active", "正在播放", "正在监测学习进度");
+          }
+        } catch (error) {
+          const now = Date.now();
+          ui.setStatus("error", "发生错误", "页面结构暂时无法识别，将继续重试");
+          if (now - state.lastErrorAt > 1e4) {
+            state.lastErrorAt = now;
             ui.showToast(
-                'autoplay-blocked',
-                '浏览器阻止了自动播放，请手动点击页面或视频后重试。',
-                { tone: 'warning', duration: 5000 }
+              "page-check-error",
+              "页面检测出现异常，助手将在后台继续重试。",
+              { tone: "error", duration: 5e3 }
             );
-            console.warn('[SYSU LMS Assistant] Video playback was blocked:', error);
-            armPlaybackRetry(video);
+            console.error("[SYSU LMS Assistant] Page check failed:", error);
+          }
         }
-
-        function armPlaybackRetry(video) {
-            if (state.retryInteractionCleanup) return;
-
-            const retryAfterInteraction = () => {
-                clearPlaybackRetry();
-                if (state.currentVideo !== video || !settings.assistantEnabled || !settings.autoPlay) return;
-                state.autoplayBlockedFor = null;
-                nativeTimers.setTimeout(checkPage, 0);
-            };
-
-            document.addEventListener('pointerdown', retryAfterInteraction, true);
-            document.addEventListener('keydown', retryAfterInteraction, true);
-            state.retryInteractionCleanup = () => {
-                document.removeEventListener('pointerdown', retryAfterInteraction, true);
-                document.removeEventListener('keydown', retryAfterInteraction, true);
-                state.retryInteractionCleanup = null;
-            };
+      }
+      function handleForumDiscussionPage(nextLink) {
+        ui.setPageType("讨论页");
+        if (!settings.autoCompleteForum) {
+          clearForumTask();
+          resetForumRuntimeState();
+          if (settings.skipForum) {
+            handleForumSkip(nextLink);
+            return;
+          }
+          ui.setStatus("active", "等待手动操作", "讨论页跳过和任务自动完成均已关闭");
+          return;
         }
-
-        function clearPlaybackRetry() {
-            if (state.retryInteractionCleanup) state.retryInteractionCleanup();
+        if (ui.isForumTemplateEditing()) {
+          ui.setStatus("active", "正在编辑设置", "保存回复模板后继续处理讨论任务");
+          return;
         }
-
-        return {
-            start,
-            stop,
-            handleSettingChange,
-            retryForumTask
+        const requirement = getForumCompletionRequirement2();
+        if (requirement.completed) {
+          completeForumTask(nextLink);
+          return;
+        }
+        if (state.forumAutomationBlocked) {
+          ui.setStatus("error", "讨论任务失败", state.lastForumFailureMessage);
+          ui.setForumRetryVisible(state.forumRetryAllowed);
+          return;
+        }
+        if (!requirement.recognized) {
+          blockForumTask(
+            "unsupported-requirement",
+            "未识别到“发表论坛帖子”完成要求，请手动处理。",
+            { retry: false }
+          );
+          return;
+        }
+        const templates = parseForumReplyTemplates(settings.forumReplyTemplates);
+        if (templates.length === 0) {
+          showForumTemplateError();
+          return;
+        }
+        let task = readForumTask();
+        if (task && !isValidForumTask(task)) {
+          if (!clearForumTask()) {
+            blockForumTask(
+              "invalid-task-clear-failed",
+              "讨论待办已损坏且无法清除，已停止自动操作。",
+              { retry: false }
+            );
+            return;
+          }
+          task = null;
+        }
+        if (task && !isTaskForCurrentDiscussion(task)) {
+          blockForumTask(
+            "activity-mismatch",
+            "讨论待办与当前活动不匹配，为防止误发已停止。",
+            { task }
+          );
+          return;
+        }
+        if (task) {
+          if (isForumTaskExpired(task, Date.now(), FORUM_TASK_MAX_AGE)) {
+            blockForumTask("task-expired", "讨论任务等待已超过 10 分钟，请手动重试。", { task });
+            return;
+          }
+          if (task.phase === "failed") {
+            blockForumTask(
+              task.errorCode || "previous-failure",
+              "上次自动回复未能确认完成，请检查页面后重试。",
+              { task }
+            );
+            return;
+          }
+          if (task.phase === "attempted") {
+            verifyForumCompletion(task, nextLink);
+            return;
+          }
+          blockForumTask(
+            "reply-navigation-incomplete",
+            "回复页面未能正常打开，为防止重复发帖已停止。",
+            { task }
+          );
+          return;
+        }
+        startForumReply(templates);
+      }
+      function handleForumSkip(nextLink) {
+        ui.setForumRetryVisible(false);
+        if (!nextLink) {
+          ui.setStatus("warning", "需要手动操作", "讨论页没有可用的下一页链接");
+          if (!state.forumNoticeShown) {
+            state.forumNoticeShown = true;
+            ui.showToast(
+              "forum-no-next",
+              "检测到讨论页，但没有找到下一页链接。",
+              { tone: "warning", duration: 5e3 }
+            );
+          }
+          return;
+        }
+        scheduleNavigation(
+          "forum-skip",
+          nextLink,
+          SKIP_FORUM_DELAY,
+          `检测到讨论页，${SKIP_FORUM_DELAY / 1e3} 秒后自动跳过。`,
+          "forum-skip"
+        );
+      }
+      function getForumCompletionRequirement2() {
+        return getForumCompletionRequirement(document);
+      }
+      function getForumActivityId2() {
+        return getForumActivityId(window.location);
+      }
+      function getForumDiscussionId2() {
+        return getForumDiscussionId(document, window.location);
+      }
+      function getNormalizedPageUrl2() {
+        return getNormalizedPageUrl(window.location);
+      }
+      function isTaskForCurrentDiscussion(task) {
+        try {
+          const currentUrl = new URL(window.location.href);
+          const sourceUrl = new URL(task.sourceUrl);
+          if (sourceUrl.origin !== currentUrl.origin) return false;
+          if (sourceUrl.pathname === currentUrl.pathname) {
+            return task.activityId === getForumActivityId2();
+          }
+          return task.phase === "attempted" && currentUrl.pathname === "/mod/forum/discuss.php" && typeof task.discussionId === "string" && task.discussionId === getForumDiscussionId2();
+        } catch {
+          return false;
+        }
+      }
+      function getReplyTargets2() {
+        return getReplyTargets(document, window.location);
+      }
+      function startForumReply(templates) {
+        const activityId = getForumActivityId2();
+        if (!activityId) {
+          blockForumTask(
+            "missing-activity-id",
+            "无法识别当前讨论活动编号，请手动处理。",
+            { retry: false }
+          );
+          return;
+        }
+        const target = chooseRandomItem(getReplyTargets2());
+        if (!target) {
+          blockForumTask("missing-reply-link", "当前讨论没有可用的回复入口。");
+          return;
+        }
+        const replyText = chooseRandomItem(templates);
+        const task = {
+          activityId,
+          discussionId: getForumDiscussionId2(),
+          sourceUrl: getNormalizedPageUrl2(),
+          replyPostId: target.replyPostId,
+          replyText,
+          phase: "opening",
+          verifyReloaded: false,
+          startedAt: Date.now(),
+          errorCode: null
         };
+        if (!writeForumTask(task)) {
+          blockForumTask(
+            "session-storage-unavailable",
+            "无法保存防重复状态，已取消自动回复。"
+          );
+          return;
+        }
+        ui.setForumRetryVisible(false);
+        ui.setStatus("active", "正在打开回复页", "已选择回复内容，正在进入 Moodle 原生表单");
+        ui.showToast("forum-opening-reply", "正在打开讨论回复页面。");
+        state.hasNavigated = true;
+        window.location.assign(target.url.href);
+      }
+      function verifyForumCompletion(task, nextLink) {
+        if (task.verifyReloaded) {
+          blockForumTask(
+            "completion-unconfirmed",
+            "平台刷新后仍未确认讨论完成，为防止重复发帖已停止。",
+            { task }
+          );
+          return;
+        }
+        ui.setForumRetryVisible(false);
+        ui.setStatus("active", "等待平台确认", "正在等待“发表论坛帖子”完成状态更新");
+        if (state.forumVerificationTimeoutId !== null) return;
+        state.forumVerificationTimeoutId = nativeTimers.setTimeout(() => {
+          state.forumVerificationTimeoutId = null;
+          if (!settings.assistantEnabled || !settings.autoCompleteForum) return;
+          const latestTask = readForumTask();
+          if (!latestTask || latestTask.phase !== "attempted") return;
+          const latestRequirement = getForumCompletionRequirement2();
+          if (latestRequirement.recognized && latestRequirement.completed) {
+            completeForumTask(nextLink);
+            return;
+          }
+          const updatedTask = { ...latestTask, verifyReloaded: true };
+          if (!writeForumTask(updatedTask)) {
+            blockForumTask(
+              "verification-state-save-failed",
+              "无法保存完成验证状态，已停止自动操作。",
+              { task: latestTask }
+            );
+            return;
+          }
+          state.hasNavigated = true;
+          window.location.reload();
+        }, FORUM_VERIFICATION_DELAY);
+      }
+      function completeForumTask(nextLink) {
+        clearForumTask();
+        resetForumRuntimeState();
+        if (nextLink && settings.autoNext) {
+          scheduleNavigation(
+            "auto-next",
+            nextLink,
+            DELAY_BEFORE_NEXT,
+            `讨论任务已完成，${DELAY_BEFORE_NEXT / 1e3} 秒后进入下一页。`,
+            "forum-complete"
+          );
+        } else if (!nextLink) {
+          ui.setStatus("complete", "已完成", "讨论任务已完成，当前为最后一节");
+          ui.showToast(
+            "forum-last-activity",
+            "讨论任务已完成，当前为最后一节。",
+            { tone: "success", duration: 5e3 }
+          );
+          stop();
+        } else {
+          ui.setStatus("complete", "已完成", "自动下一页已关闭，请手动继续");
+        }
+      }
+      function showForumTemplateError() {
+        ui.setForumRetryVisible(false);
+        ui.setStatus("warning", "需要设置回复", "随机回复模板至少需要一条非空内容");
+        if (state.lastForumFailureCode !== "empty-template") {
+          state.lastForumFailureCode = "empty-template";
+          ui.showToast(
+            "forum-empty-template",
+            "讨论回复模板为空，请在控制面板中填写后重试。",
+            { tone: "warning", duration: 5e3 }
+          );
+        }
+      }
+      function handleForumPostPage() {
+        ui.setPageType("讨论回复页");
+        if (!settings.autoCompleteForum) {
+          clearForumTask();
+          resetForumRuntimeState();
+          ui.setStatus("active", "等待手动操作", "讨论任务自动完成已关闭");
+          return;
+        }
+        if (state.forumAutomationBlocked) {
+          ui.setStatus("error", "讨论任务失败", state.lastForumFailureMessage);
+          ui.setForumRetryVisible(state.forumRetryAllowed);
+          return;
+        }
+        const task = readForumTask();
+        if (!task || !isValidForumTask(task)) {
+          blockForumTask(
+            "missing-pending-task",
+            "未找到有效的讨论回复待办，请返回讨论页后重试。"
+          );
+          return;
+        }
+        if (isForumTaskExpired(task, Date.now(), FORUM_TASK_MAX_AGE)) {
+          blockForumTask("task-expired", "讨论任务等待已超过 10 分钟，请手动重试。", { task });
+          return;
+        }
+        const replyPostId = new URL(window.location.href).searchParams.get("reply");
+        if (replyPostId !== String(task.replyPostId)) {
+          blockForumTask("reply-target-mismatch", "回复目标与待办记录不一致，已停止提交。", { task });
+          return;
+        }
+        if (task.phase === "failed") {
+          blockForumTask(
+            task.errorCode || "previous-failure",
+            "上次自动回复失败，请检查页面后重试。",
+            { task }
+          );
+          return;
+        }
+        if (task.phase === "attempted") {
+          if (state.forumSubmitStartedAt > 0 && Date.now() - state.forumSubmitStartedAt < FORUM_FORM_TIMEOUT) {
+            ui.setForumRetryVisible(false);
+            ui.setStatus("active", "正在提交回复", "等待 Moodle 接收并返回讨论页");
+          } else {
+            blockForumTask(
+              "submit-did-not-navigate",
+              "回复提交后页面未正常返回，为防止重复发帖已停止。",
+              { task }
+            );
+          }
+          return;
+        }
+        if (state.forumFormWaitStartedAt === 0) {
+          state.forumFormWaitStartedAt = Date.now();
+        }
+        const form = document.querySelector("form#mformforum");
+        if (!form) {
+          if (Date.now() - state.forumFormWaitStartedAt < FORUM_FORM_TIMEOUT) {
+            ui.setForumRetryVisible(false);
+            ui.setStatus("active", "等待回复表单", "正在等待 Moodle 加载原生回复表单");
+            return;
+          }
+          blockForumTask("reply-form-missing", "等待 10 秒后仍未找到 Moodle 回复表单。", { task });
+          return;
+        }
+        const textarea = findForumTextarea2(form);
+        const contentEditable = form.querySelector(
+          '[contenteditable="true"][role="textbox"], [contenteditable="true"]'
+        );
+        if (!textarea && !contentEditable) {
+          if (Date.now() - state.forumFormWaitStartedAt < FORUM_FORM_TIMEOUT) {
+            ui.setStatus("active", "等待回复编辑器", "正在等待 Moodle 初始化回复编辑器");
+            return;
+          }
+          blockForumTask("reply-editor-missing", "未找到兼容的 Moodle 回复编辑器。", { task });
+          return;
+        }
+        const submitButton = findForumSubmitButton2(form);
+        if (!submitButton) {
+          if (Date.now() - state.forumFormWaitStartedAt < FORUM_FORM_TIMEOUT) {
+            ui.setStatus("active", "等待提交按钮", "正在等待 Moodle 初始化发表按钮");
+            return;
+          }
+          blockForumTask("reply-submit-missing", "未找到兼容的 Moodle 发表按钮。", { task });
+          return;
+        }
+        if (submitButton.disabled || submitButton.getAttribute("aria-disabled") === "true") {
+          if (Date.now() - state.forumFormWaitStartedAt < FORUM_FORM_TIMEOUT) {
+            ui.setStatus("active", "等待提交按钮", "Moodle 仍在初始化发表按钮");
+            return;
+          }
+          blockForumTask("reply-submit-disabled", "Moodle 发表按钮持续不可用。", { task });
+          return;
+        }
+        fillForumReply2(textarea, contentEditable, task.replyText);
+        const attemptedTask = { ...task, phase: "attempted", errorCode: null };
+        if (!writeForumTask(attemptedTask)) {
+          blockForumTask(
+            "attempt-state-save-failed",
+            "无法保存已提交状态，为防止重复发帖已取消提交。",
+            { task }
+          );
+          return;
+        }
+        state.forumSubmitStartedAt = Date.now();
+        ui.setForumRetryVisible(false);
+        ui.setStatus("active", "正在提交回复", "已填充随机回复，正在交由 Moodle 原生表单提交");
+        ui.showToast("forum-submitting", "正在提交讨论回复，请勿关闭页面。");
+        try {
+          if (typeof form.requestSubmit === "function") {
+            form.requestSubmit(submitButton);
+          } else {
+            submitButton.click();
+          }
+        } catch (error) {
+          blockForumTask("reply-submit-error", "Moodle 回复表单提交失败，请手动重试。", {
+            task: attemptedTask
+          });
+          console.error("[SYSU LMS Assistant] Forum reply submission failed:", error);
+        }
+      }
+      function findForumTextarea2(form) {
+        return findForumTextarea(form);
+      }
+      function findForumSubmitButton2(form) {
+        return findForumSubmitButton(form);
+      }
+      function fillForumReply2(textarea, contentEditable, replyText) {
+        fillForumReply(textarea, contentEditable, replyText);
+      }
+      function blockForumTask(code, message, { task = readForumTask(), retry = true } = {}) {
+        if (task && isValidForumTask(task)) {
+          writeForumTask({ ...task, phase: "failed", errorCode: code });
+        }
+        state.forumAutomationBlocked = true;
+        state.forumRetryAllowed = retry;
+        clearForumVerification();
+        state.lastForumFailureMessage = message;
+        ui.setForumRetryVisible(retry);
+        ui.setStatus("error", "讨论任务失败", message);
+        if (state.lastForumFailureCode !== code) {
+          state.lastForumFailureCode = code;
+          const recoveryMessage = retry ? `${message} 可在控制面板中重试。` : message;
+          ui.showToast(`forum-failure-${code}`, recoveryMessage, {
+            tone: "error",
+            duration: 5e3
+          });
+        }
+      }
+      function resetForumRuntimeState() {
+        clearForumVerification();
+        state.forumFormWaitStartedAt = 0;
+        state.forumSubmitStartedAt = 0;
+        state.forumAutomationBlocked = false;
+        state.forumRetryAllowed = false;
+        state.lastForumFailureCode = null;
+        state.lastForumFailureMessage = "";
+        ui.setForumRetryVisible(false);
+      }
+      function retryForumTask() {
+        const task = readForumTask();
+        const sourceUrl = task?.sourceUrl || null;
+        if (!clearForumTask()) {
+          blockForumTask(
+            "retry-state-clear-failed",
+            "无法清除旧的防重复状态，已取消重试。"
+          );
+          return;
+        }
+        resetForumRuntimeState();
+        ui.setStatus("active", "准备重试", "正在重新选择回复目标和内容");
+        if (window.location.pathname === "/mod/forum/post.php" && sourceUrl) {
+          try {
+            const url = new URL(sourceUrl);
+            if (url.origin !== window.location.origin) throw new TypeError("Cross-origin source URL.");
+            state.hasNavigated = true;
+            window.location.assign(url.href);
+            return;
+          } catch {
+            blockForumTask("invalid-source-url", "原讨论页地址无效，无法自动返回。");
+            return;
+          }
+        }
+        nativeTimers.setTimeout(checkPage, 0);
+      }
+      function handleQuality(video) {
+        if (!settings.autoQuality) return;
+        const qualityContainer = document.querySelector(".tcp-video-quality-switcher");
+        if (!qualityContainer) return;
+        const attemptTarget = video || qualityContainer;
+        if (state.qualityAttemptedFor === attemptTarget) return;
+        const qualityText = qualityContainer.querySelector(".tcp-quality-switcher-value p");
+        const currentQuality = qualityText ? qualityText.innerText.trim() : "";
+        if (currentQuality !== "超清") {
+          const hdOption = findHdOption(qualityContainer);
+          if (hdOption) {
+            hdOption.click();
+            ui.setAction("已自动切换为超清画质");
+            ui.showToast("quality-hd", "已自动切换为超清画质。", { tone: "success" });
+          } else {
+            ui.showToast(
+              "quality-missing",
+              "当前视频没有可用的超清选项，将保持默认画质。",
+              { tone: "warning" }
+            );
+          }
+        }
+        state.qualityAttemptedFor = attemptTarget;
+      }
+      function handleCompletion(video, nextLink) {
+        const {
+          completed,
+          hasProgressTracker,
+          progress,
+          videoEnded
+        } = getCompletionState(document, video);
+        if (completed) {
+          if (nextLink && settings.autoNext) {
+            scheduleNavigation(
+              "auto-next",
+              nextLink,
+              DELAY_BEFORE_NEXT,
+              `学习任务已完成，${DELAY_BEFORE_NEXT / 1e3} 秒后进入下一页。`,
+              "activity-complete"
+            );
+          } else if (!nextLink) {
+            ui.setStatus("complete", "已完成", "当前为最后一节，自动化已停止");
+            ui.showToast(
+              "course-last-activity",
+              "学习任务已完成，当前为最后一节。",
+              { tone: "success", duration: 5e3 }
+            );
+            stop();
+          } else {
+            ui.setStatus("complete", "已完成", "自动下一页已关闭，请手动继续");
+          }
+          return;
+        }
+        if (videoEnded && hasProgressTracker && video && !state.replayInProgress) {
+          if (!settings.autoPlay) {
+            ui.setStatus("warning", "需要手动操作", `视频已结束但进度为 ${progress}%，自动播放已关闭`);
+            return;
+          }
+          state.replayInProgress = true;
+          video.currentTime = 0;
+          ui.setStatus("warning", "正在修复进度", `视频已结束但进度为 ${progress}%，正在重播`);
+          ui.showToast(
+            "progress-replay",
+            `视频已结束但进度为 ${progress}%，正在自动重播补全进度。`,
+            { tone: "warning", duration: 5e3 }
+          );
+          attemptPlay(video, true);
+        }
+      }
+      function scheduleNavigation(kind, nextLink, delay, message, toastKey) {
+        if (state.hasNavigated) return;
+        const scheduled = navigation.schedule({
+          kind,
+          link: nextLink,
+          delay,
+          isCurrent: () => settings.assistantEnabled && (kind === "forum-skip" ? settings.skipForum && !settings.autoCompleteForum : settings.autoNext),
+          onNavigate: () => ui.setAction("正在进入下一页")
+        });
+        if (!scheduled) return;
+        state.hasNavigated = true;
+        ui.setStatus("active", "等待跳转", message);
+        ui.showToast(toastKey, message, { tone: "success" });
+      }
+      function cancelNavigation(kind = null, announce = false) {
+        const cancelled = navigation.cancel(kind);
+        if (!cancelled) return false;
+        state.hasNavigated = false;
+        if (announce) {
+          ui.setAction("设置已更新，已取消等待中的自动跳转");
+          ui.showToast(
+            "navigation-cancelled",
+            "已取消等待中的自动跳转。",
+            { tone: "warning" }
+          );
+        }
+        return true;
+      }
+      function clearForumVerification() {
+        if (state.forumVerificationTimeoutId === null) return;
+        nativeTimers.clearTimeout(state.forumVerificationTimeoutId);
+        state.forumVerificationTimeoutId = null;
+      }
+      function attachVideo(video) {
+        if (state.currentVideo === video) return;
+        detachVideo();
+        state.currentVideo = video;
+        state.autoplayBlockedFor = null;
+        state.replayInProgress = false;
+        state.qualityAttemptedFor = null;
+        if (!video) return;
+        const handlePause = () => {
+          if (!settings.assistantEnabled || !settings.autoPlay || video.ended || state.hasNavigated) return;
+          ui.setStatus("warning", "检测到暂停", "正在尝试恢复视频播放");
+          ui.showToast(
+            "video-paused",
+            "检测到视频暂停，正在尝试恢复播放。",
+            { tone: "warning" }
+          );
+          attemptPlay(video, true);
+        };
+        const handlePlay = () => {
+          state.autoplayBlockedFor = null;
+          state.replayInProgress = false;
+          clearPlaybackRetry();
+          if (settings.assistantEnabled) {
+            ui.setStatus("active", "正在播放", "正在监测学习进度");
+          }
+        };
+        state.videoHandlers = { handlePause, handlePlay };
+        video.addEventListener("pause", handlePause);
+        video.addEventListener("play", handlePlay);
+      }
+      function detachVideo() {
+        if (state.currentVideo && state.videoHandlers) {
+          state.currentVideo.removeEventListener("pause", state.videoHandlers.handlePause);
+          state.currentVideo.removeEventListener("play", state.videoHandlers.handlePlay);
+        }
+        state.currentVideo = null;
+        state.videoHandlers = null;
+        clearPlaybackRetry();
+      }
+      function attemptPlay(video, isRecovery) {
+        if (!settings.assistantEnabled || !settings.autoPlay || !video) return;
+        video.muted = true;
+        let playResult;
+        try {
+          playResult = video.play();
+        } catch (error) {
+          handlePlayFailure(video, error);
+          return;
+        }
+        if (playResult && typeof playResult.catch === "function") {
+          playResult.catch((error) => handlePlayFailure(video, error));
+        } else if (isRecovery) {
+          ui.setAction("已请求恢复视频播放");
+        }
+      }
+      function handlePlayFailure(video, error) {
+        if (state.currentVideo !== video || !settings.assistantEnabled || !settings.autoPlay) return;
+        state.autoplayBlockedFor = video;
+        state.replayInProgress = false;
+        ui.setStatus("warning", "需要手动操作", "浏览器阻止了自动播放，请点击页面激活视频");
+        ui.showToast(
+          "autoplay-blocked",
+          "浏览器阻止了自动播放，请手动点击页面或视频后重试。",
+          { tone: "warning", duration: 5e3 }
+        );
+        console.warn("[SYSU LMS Assistant] Video playback was blocked:", error);
+        armPlaybackRetry(video);
+      }
+      function armPlaybackRetry(video) {
+        if (state.retryInteractionCleanup) return;
+        const retryAfterInteraction = () => {
+          clearPlaybackRetry();
+          if (state.currentVideo !== video || !settings.assistantEnabled || !settings.autoPlay) return;
+          state.autoplayBlockedFor = null;
+          nativeTimers.setTimeout(checkPage, 0);
+        };
+        document.addEventListener("pointerdown", retryAfterInteraction, true);
+        document.addEventListener("keydown", retryAfterInteraction, true);
+        state.retryInteractionCleanup = () => {
+          document.removeEventListener("pointerdown", retryAfterInteraction, true);
+          document.removeEventListener("keydown", retryAfterInteraction, true);
+          state.retryInteractionCleanup = null;
+        };
+      }
+      function clearPlaybackRetry() {
+        if (state.retryInteractionCleanup) state.retryInteractionCleanup();
+      }
+      return {
+        start,
+        stop,
+        handleSettingChange,
+        retryForumTask
+      };
     }
+  })();
 })();

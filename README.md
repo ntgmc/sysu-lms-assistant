@@ -2,7 +2,7 @@
 
 [![JavaScript](https://img.shields.io/badge/Language-JavaScript-yellow.svg)](https://developer.mozilla.org/en-US/docs/Web/JavaScript)
 [![Tampermonkey](https://img.shields.io/badge/Extension-Tampermonkey-black.svg)](https://www.tampermonkey.net/)
-[![Version](https://img.shields.io/badge/Version-2.1.1-blue.svg)](#)
+[![Version](https://img.shields.io/badge/Version-2.2.0-blue.svg)](#)
 
 这是一个为中山大学 LMS 编写的浏览器用户脚本。它将视频自动播放、自动下一页、进度修复、讨论页跳过、讨论任务自动完成和可选计时加速整合在一个脚本中，并通过统一控制面板管理所有功能。
 
@@ -35,6 +35,7 @@
 - 支持 `2×`、`5×`、`10×`、`25×` 和 `50×` 五档计时加速预设。
 - 设置跨页面保存在浏览器本地，不上传数据，也不包含遥测。
 - 支持键盘操作、明暗主题、减少动态效果和屏幕阅读器通知。
+- 关闭总开关、自动下一页或讨论页跳过时，会立即取消仍在倒计时的自动跳转。
 
 ### 可选计时加速
 
@@ -98,7 +99,40 @@
 | `lms-script.user.js` | 唯一推荐安装的统一助手，包含全部功能和控制面板 |
 | `time-hacker.user.js` | 旧加速器的迁移兼容脚本，不再修改页面计时器 |
 
+仓库中的 `src/` 保存模块化源码，根目录的两个 `.user.js` 是由 esbuild 生成并提交的安装产物。最终用户仍只需安装用户脚本，不需要 Node.js 或构建工具。
+
+## 🧪 开发与验证
+
+开发环境需要 Node.js 20 或更高版本。首次检出后安装锁定依赖：
+
+```bash
+npm ci
+```
+
+常用命令：
+
+```bash
+npm run lint          # 静态检查源码与测试
+npm test              # 运行 jsdom 单元与集成测试
+npm run test:coverage # 生成覆盖率报告
+npm run build         # 更新根目录用户脚本产物
+npm run build:check   # 只比较产物，不改写文件
+npm run check         # 执行 lint、测试和产物一致性检查
+```
+
+GitHub Actions 会在 Node.js 20 和 22 上运行完整检查。提交源码改动前应先执行 `npm run build`，再执行 `npm run check`，确保安装产物与源码一致。
+
+人工验收应覆盖 Tampermonkey/Violentmonkey 安装、普通课程页、视频页、资源停留页、讨论页、回复页、设置持久化和旧迁移通知。论坛自动提交只能在专用测试课程中验证，禁止在生产课程中进行无意发帖测试。
+
 ## 📝 更新日志
+
+### 2.2.0
+
+- 将统一助手和迁移脚本改为模块化源码，并使用 esbuild 生成保持原安装地址不变的单文件用户脚本。
+- 新增可取消导航调度器；关闭相关设置、停止控制器或页面上下文变化时，不再执行已经排队的跳转。
+- 集中管理论坛验证定时器、视频监听和交互重试监听，减少旧页面异步任务继续运行的风险。
+- 抽取设置、计时器、页面识别、论坛状态与 Moodle DOM 适配器，并保留原有防重复提交保护。
+- 新增 ESLint、Vitest/jsdom 测试、确定性构建检查和 Node.js 20/22 GitHub Actions。
 
 ### 2.1.1
 

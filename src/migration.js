@@ -1,55 +1,48 @@
-// ==UserScript==
-// @name         time-hacker
-// @namespace    Violentmonkey Scripts
-// @match        https://lms.sysu.edu.cn/mod/fsresource/view.php*
-// @grant        none
-// @version      2.2.0
-// @author       ntgmc
-// @description  迁移兼容脚本：计时加速已合并到中山大学 LMS 助手，请改用统一脚本。
-// @homepage     https://github.com/ntgmc/sysu-lms-assistant
-// @supportURL   https://github.com/ntgmc/sysu-lms-assistant/issues
-// @run-at       document-start
-// @license      GPL-3.0 License
-// ==/UserScript==
+(function() {
+    'use strict';
 
-(() => {
-  // src/migration.js
-  (function() {
-    "use strict";
-    const ASSISTANT_INSTANCE_KEY = "__SYSU_LMS_ASSISTANT_V2__";
-    const DISMISSED_KEY = "sysu_lms_time_hacker_migration_dismissed";
-    const INSTALL_URL = "https://raw.githubusercontent.com/ntgmc/sysu-lms-assistant/main/lms-script.user.js";
+    const ASSISTANT_INSTANCE_KEY = '__SYSU_LMS_ASSISTANT_V2__';
+    const DISMISSED_KEY = 'sysu_lms_time_hacker_migration_dismissed';
+    const INSTALL_URL = 'https://raw.githubusercontent.com/ntgmc/sysu-lms-assistant/main/lms-script.user.js';
+
     if (window[ASSISTANT_INSTANCE_KEY]) return;
-    if (document.readyState === "loading") {
-      document.addEventListener("DOMContentLoaded", showMigrationNotice, { once: true });
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', showMigrationNotice, { once: true });
     } else {
-      showMigrationNotice();
+        showMigrationNotice();
     }
+
     function isDismissed() {
-      try {
-        return window.localStorage.getItem(DISMISSED_KEY) === "true";
-      } catch {
-        return false;
-      }
+        try {
+            return window.localStorage.getItem(DISMISSED_KEY) === 'true';
+        } catch {
+            return false;
+        }
     }
+
     function rememberDismissal() {
-      try {
-        window.localStorage.setItem(DISMISSED_KEY, "true");
-      } catch {
-      }
+        try {
+            window.localStorage.setItem(DISMISSED_KEY, 'true');
+        } catch {
+            // The notice still closes for this page when storage is unavailable.
+        }
     }
+
     function showMigrationNotice() {
-      if (window[ASSISTANT_INSTANCE_KEY] || isDismissed() || !document.body) return;
-      const host = document.createElement("div");
-      host.id = "sysu-lms-time-hacker-migration";
-      host.style.cssText = [
-        "position: fixed",
-        "right: 16px",
-        "bottom: 16px",
-        "z-index: 2147482999"
-      ].join(";");
-      const shadow = host.attachShadow({ mode: "open" });
-      shadow.innerHTML = `
+        if (window[ASSISTANT_INSTANCE_KEY] || isDismissed() || !document.body) return;
+
+        const host = document.createElement('div');
+        host.id = 'sysu-lms-time-hacker-migration';
+        host.style.cssText = [
+            'position: fixed',
+            'right: 16px',
+            'bottom: 16px',
+            'z-index: 2147482999'
+        ].join(';');
+
+        const shadow = host.attachShadow({ mode: 'open' });
+        shadow.innerHTML = `
             <style>
                 :host {
                     color-scheme: light dark;
@@ -155,11 +148,11 @@
                 </div>
             </section>
         `;
-      shadow.getElementById("dismiss").addEventListener("click", () => {
-        rememberDismissal();
-        host.remove();
-      });
-      document.body.appendChild(host);
+
+        shadow.getElementById('dismiss').addEventListener('click', () => {
+            rememberDismissal();
+            host.remove();
+        });
+        document.body.appendChild(host);
     }
-  })();
 })();
